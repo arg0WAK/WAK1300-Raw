@@ -5,7 +5,7 @@ await build({
   entryPoints: ["js/helper.js"],
   bundle: true,
   format: "iife",
-  outfile: "js/bundle.js",
+  outfile: "build/js/bundle.js",
   plugins: [
     {
       name: "worker-as-text",
@@ -20,4 +20,4 @@ await build({
 });
 
 const ts = new Date().toLocaleString();
-console.log(`[${ts}] BUILD OK -> js/bundle.js`);
+console.log(`[${ts}] BUILD OK -> build/js/bundle.js`);
