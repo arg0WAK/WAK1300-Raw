@@ -4,13 +4,7 @@ CACHE MANIFEST
 CACHE:
 index.html
 assets/index.css
-js/core.js
-js/int64.js
-js/jb.js
-js/mem.js
-js/ps4_offsets.js
-js/rpc_worker.js
-js/helper.js
+js/bundle.js
 binaries/1302.bin
 binaries/1352.bin
 binaries/1350.bin
