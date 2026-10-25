@@ -28,13 +28,7 @@ Optional WebSocket logging can be enabled by setting `WS_MODE` to `true` and con
         │   ├── 1350.bin            # 13.50 AIO Fix Binary
         │   └── 1352.bin            # 13.52 AIO Fix Binary
         ├── js/
-        │   ├── helper.js           # UI helpers, state management, and event handling
-        │   ├── core.js             # Core exploit logic and execution flow
-        │   ├── mem.js              # Memory access and manipulation utilities
-        │   ├── ps4_offsets.js      # Firmware-specific offsets and gadget definitions
-        │   ├── rpc_worker.js       # Worker-based RPC operations and writePL handling
-        │   ├── jb.js               # Jailbreak routines and kernel exploitation logic
-        │   └── int64.js            # 64-bit integer operations and conversion utilities
+        │   └── bundle.js           # Bundled exploit script (core, mem, jb, int64, helper, rpc worker)
         ├── payloads/
         │   └── goldhen.bin         # GoldHEN v2.4b18.12 Payload
         ├── cache.manifest          # Offline AppCache manifest
