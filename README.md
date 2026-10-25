@@ -37,10 +37,24 @@ Optional WebSocket logging can be enabled by setting `WS_MODE` to `true` and con
         │   └── int64.js            # 64-bit integer operations and conversion utilities
         ├── payloads/
         │   └── goldhen.bin         # GoldHEN v2.4b18.12 Payload
+        ├── build.mjs               # esbuild script bundling js/ into js/bundle.js
+        ├── package.json            # Build tooling and esbuild dependency
+        ├── package-lock.json       # Locked dependency versions
         ├── cache.manifest          # Offline AppCache manifest
         ├── fiveserver.config.cjs   # Five Server local deployment configuration
         ├── index.html              # Main orchestrator interface
         └── README.md               # Project documentation
+
+## Build
+
+```bash
+npm install
+npm run build
+```
+
+This produces `js/bundle.js` (bundles `js/helper.js` and its full import chain, including `rpc_worker.js`, into a single file).
+
+After making changes on `main`, run `npm run build` and move the updated `js/bundle.js` to the `release` branch.
 
 ## Deployment and Usage
 
