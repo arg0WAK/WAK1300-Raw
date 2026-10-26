@@ -114,7 +114,7 @@ If you prefer not to modify your network DNS settings, you can launch the host d
 
 - **Core Bug:** [SceneCollective](https://hackerone.com/playstation/hacktivity?type=team)
 - **Exploit Chain:** [raw13g](https://github.com/raw13g/raw13g.github.io)
-- **AIO Fix** [Al-Azif](https://github.com/al-azif)
+- **AIO Fix** [Al-Azif](https://github.com/al-azif) + [MODDEDWARFARE](https://github.com/MODDEDWARFARE) 
 - **GoldHEN:** [SiSTRo](https://github.com/SiSTR0)
 - **Modular Architecture, Implementation & UI:** [arg0WAK](https://github.com/arg0WAK)
 
